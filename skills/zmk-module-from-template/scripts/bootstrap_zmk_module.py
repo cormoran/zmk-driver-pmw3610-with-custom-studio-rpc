@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--visibility",
         choices=("public", "private", "internal"),
-        default="public",
+        default="private",
         help="Visibility for the new GitHub repository.",
     )
     parser.add_argument(
