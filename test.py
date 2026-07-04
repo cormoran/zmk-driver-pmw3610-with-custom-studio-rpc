@@ -95,6 +95,21 @@ class WestCommandsTests(unittest.TestCase):
                         "DT_COMPAT_HAS_OKAY_cormoran_pmw3610",
                     ],
                 ),
+                "pmw3610_settings_rpc": ConfigAndDeviceTree(
+                    config=[
+                        "CONFIG_PMW3610=y",
+                        "CONFIG_ZMK_STUDIO=y",
+                        "CONFIG_ZMK_PMW3610_STUDIO_RPC=y",
+                        "CONFIG_ZMK_CUSTOM_SETTINGS=y",
+                        "CONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC=y",
+                        "CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y",
+                        "CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE=256",
+                        "CONFIG_ZMK_STUDIO_RPC_RX_BUF_SIZE=128",
+                    ],
+                    device=[
+                        "DT_COMPAT_HAS_OKAY_cormoran_pmw3610",
+                    ],
+                ),
             }
         )
 

@@ -4,17 +4,67 @@ package cormoran.pmw3610;
 
 message GetInfoRequest {}
 
+message RuntimeConfig {
+    uint32 cpi = 1;
+    bool swap_xy = 2;
+    bool invert_x = 3;
+    bool invert_y = 4;
+    bool force_awake = 5;
+    bool smart_algorithm = 6;
+    uint32 run_downshift_ms = 7;
+    uint32 rest1_downshift_ms = 8;
+    uint32 rest2_downshift_ms = 9;
+    uint32 rest1_sample_ms = 10;
+    uint32 rest2_sample_ms = 11;
+    uint32 rest3_sample_ms = 12;
+    uint32 report_interval_min_ms = 13;
+}
+
 message DeviceInfo {
     bool ready = 1;
     uint32 product_id = 2;
     uint32 revision_id = 3;
     int32 init_error = 4;
+    RuntimeConfig runtime_config = 5;
 }
 
 message GetInfoResponse { repeated DeviceInfo devices = 1; }
 
+message ReadDiagnosticsRequest { uint32 device_index = 1; }
+
+message ReadDiagnosticsResponse {
+    uint32 squal = 1;
+    uint32 shutter = 2;
+    uint32 pix_max = 3;
+    uint32 pix_avg = 4;
+    uint32 pix_min = 5;
+}
+
+message ReadRegisterRequest {
+    uint32 device_index = 1;
+    uint32 address = 2;
+}
+
+message ReadRegisterResponse { uint32 value = 1; }
+
+// Debug/tuning facility: writes an arbitrary sensor register. Exposed
+// unsecured (matching the rest of this subsystem) -- see README.md for
+// caveats before using this over an untrusted transport.
+message WriteRegisterRequest {
+    uint32 device_index = 1;
+    uint32 address = 2;
+    uint32 value = 3;
+}
+
+message WriteRegisterResponse {}
+
 message Request {
-    oneof request_type { GetInfoRequest get_info = 1; }
+    oneof request_type {
+        GetInfoRequest get_info = 1;
+        ReadDiagnosticsRequest read_diagnostics = 2;
+        ReadRegisterRequest read_register = 3;
+        WriteRegisterRequest write_register = 4;
+    }
 }
 
 message ErrorResponse { string message = 1; }
@@ -23,5 +73,8 @@ message Response {
     oneof response_type {
         ErrorResponse error = 1;
         GetInfoResponse get_info = 2;
+        ReadDiagnosticsResponse read_diagnostics = 3;
+        ReadRegisterResponse read_register = 4;
+        WriteRegisterResponse write_register = 5;
     }
 }

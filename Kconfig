@@ -107,3 +107,15 @@ config ZMK_PMW3610_STUDIO_RPC
       Custom (unofficial) ZMK Studio RPC subsystem exposing PMW3610 sensor
       info and diagnostics. Works with zero PMW3610 devices present (e.g.
       native_sim), so it does not depend on CONFIG_PMW3610 directly.
+
+config ZMK_PMW3610_CUSTOM_SETTINGS
+    bool "Enable PMW3610 runtime settings via zmk-feature-custom-settings"
+    depends on ZMK_CUSTOM_SETTINGS
+    help
+      Registers PMW3610 sensor parameters (cpi, downshift/sample times,
+      axis flags, force-awake, smart algorithm, minimum report interval) as
+      custom settings (subsystem "cormoran__pmw3610"), readable/writable
+      over the generic custom-settings Studio RPC subsystem and persisted
+      via the Zephyr settings subsystem. Works with zero PMW3610 devices
+      present (e.g. native_sim), so it does not depend on CONFIG_PMW3610
+      directly -- it just has nothing to apply the settings to.

@@ -50,6 +50,93 @@ int pmw3610_get_init_error(const struct device *dev);
  */
 int pmw3610_read_register(const struct device *dev, uint8_t addr, uint8_t *value);
 
+/** @brief Write a single register over SPI (SPI clock on/off wrapped).
+ *
+ * Intended as a debug/tuning facility (e.g. exposed by the Studio RPC
+ * WriteRegister handler). Does not validate the address/value against known
+ * safe ranges -- callers may brick sensor behavior until the next power-up
+ * reset / reconfigure.
+ *
+ * @param dev PMW3610 device.
+ * @param addr Register address.
+ * @param value Value to write.
+ * @return 0 on success, negative errno on failure.
+ */
+int pmw3610_write_register(const struct device *dev, uint8_t addr, uint8_t value);
+
+/** @brief Sensor diagnostics snapshot (see PMW3610 datasheet registers). */
+struct pmw3610_diagnostics {
+    uint8_t squal;    /**< Surface quality, reg 0x06. */
+    uint16_t shutter; /**< Shutter value, reg 0x07 (hi) / 0x08 (lo). */
+    uint8_t pix_max;  /**< Maximum pixel value, reg 0x09. */
+    uint8_t pix_avg;  /**< Average pixel value, reg 0x0A. */
+    uint8_t pix_min;  /**< Minimum pixel value, reg 0x0B. */
+};
+
+/** @brief Read SQUAL/shutter/pixel diagnostics registers.
+ *
+ * @param dev PMW3610 device.
+ * @param out Output diagnostics.
+ * @return 0 on success, negative errno on failure (e.g. -ENODEV, -EBUSY if
+ * not ready).
+ */
+int pmw3610_read_diagnostics(const struct device *dev, struct pmw3610_diagnostics *out);
+
+/** @brief Snapshot of the current runtime configuration (see
+ * struct pixart_runtime_config in pixart.h for field semantics). Duplicated
+ * here so callers (e.g. the Studio RPC handler) don't need to include the
+ * internal pixart.h.
+ */
+struct pmw3610_runtime_config {
+    uint32_t cpi;
+    bool swap_xy;
+    bool invert_x;
+    bool invert_y;
+    bool force_awake;
+    bool smart_algorithm;
+    uint32_t run_downshift_ms;
+    uint32_t rest1_downshift_ms;
+    uint32_t rest2_downshift_ms;
+    uint32_t rest1_sample_ms;
+    uint32_t rest2_sample_ms;
+    uint32_t rest3_sample_ms;
+    uint32_t report_interval_min_ms;
+};
+
+/** @brief Read the current runtime configuration snapshot.
+ *
+ * @param dev PMW3610 device.
+ * @param out Output config.
+ * @return 0 on success, negative errno on failure (e.g. -ENODEV).
+ */
+int pmw3610_get_runtime_config(const struct device *dev, struct pmw3610_runtime_config *out);
+
+/*
+ * Runtime setters.
+ *
+ * Each setter: validates the new value, stores it in the per-device runtime
+ * config (always, even if the device is not yet ready -- this lets the
+ * custom settings module seed values before async init completes, since
+ * pmw3610_async_init_configure() reads the runtime config), and, if the
+ * device has finished async init, immediately pushes the new value to the
+ * sensor over SPI.
+ *
+ * Return 0 on success, -EINVAL for out-of-range values, -ENODEV for an
+ * unknown device, or a negative errno from the SPI write if the immediate
+ * push fails (the runtime value is still updated in that case).
+ */
+int pmw3610_set_cpi_runtime(const struct device *dev, uint32_t cpi);
+int pmw3610_set_run_downshift_ms(const struct device *dev, uint32_t value);
+int pmw3610_set_rest1_downshift_ms(const struct device *dev, uint32_t value);
+int pmw3610_set_rest2_downshift_ms(const struct device *dev, uint32_t value);
+int pmw3610_set_rest1_sample_ms(const struct device *dev, uint32_t value);
+int pmw3610_set_rest2_sample_ms(const struct device *dev, uint32_t value);
+int pmw3610_set_rest3_sample_ms(const struct device *dev, uint32_t value);
+int pmw3610_set_axis_flags(const struct device *dev, bool swap_xy, bool invert_x, bool invert_y);
+int pmw3610_set_force_awake(const struct device *dev, bool enabled);
+int pmw3610_set_smart_algorithm(const struct device *dev, bool enabled);
+int pmw3610_set_report_interval_min(const struct device *dev, uint32_t value_ms);
+
 #ifdef __cplusplus
 }
 #endif

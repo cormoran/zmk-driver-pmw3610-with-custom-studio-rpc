@@ -35,3 +35,90 @@ int pmw3610_read_register(const struct device *dev, uint8_t addr, uint8_t *value
     ARG_UNUSED(value);
     return -ENODEV;
 }
+
+int pmw3610_write_register(const struct device *dev, uint8_t addr, uint8_t value) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(addr);
+    ARG_UNUSED(value);
+    return -ENODEV;
+}
+
+int pmw3610_read_diagnostics(const struct device *dev, struct pmw3610_diagnostics *out) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(out);
+    return -ENODEV;
+}
+
+int pmw3610_get_runtime_config(const struct device *dev, struct pmw3610_runtime_config *out) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(out);
+    return -ENODEV;
+}
+
+int pmw3610_set_cpi_runtime(const struct device *dev, uint32_t cpi) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(cpi);
+    return -ENODEV;
+}
+
+int pmw3610_set_run_downshift_ms(const struct device *dev, uint32_t value) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(value);
+    return -ENODEV;
+}
+
+int pmw3610_set_rest1_downshift_ms(const struct device *dev, uint32_t value) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(value);
+    return -ENODEV;
+}
+
+int pmw3610_set_rest2_downshift_ms(const struct device *dev, uint32_t value) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(value);
+    return -ENODEV;
+}
+
+int pmw3610_set_rest1_sample_ms(const struct device *dev, uint32_t value) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(value);
+    return -ENODEV;
+}
+
+int pmw3610_set_rest2_sample_ms(const struct device *dev, uint32_t value) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(value);
+    return -ENODEV;
+}
+
+int pmw3610_set_rest3_sample_ms(const struct device *dev, uint32_t value) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(value);
+    return -ENODEV;
+}
+
+int pmw3610_set_axis_flags(const struct device *dev, bool swap_xy, bool invert_x, bool invert_y) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(swap_xy);
+    ARG_UNUSED(invert_x);
+    ARG_UNUSED(invert_y);
+    return -ENODEV;
+}
+
+int pmw3610_set_force_awake(const struct device *dev, bool enabled) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(enabled);
+    return -ENODEV;
+}
+
+int pmw3610_set_smart_algorithm(const struct device *dev, bool enabled) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(enabled);
+    return -ENODEV;
+}
+
+int pmw3610_set_report_interval_min(const struct device *dev, uint32_t value_ms) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(value_ms);
+    return -ENODEV;
+}

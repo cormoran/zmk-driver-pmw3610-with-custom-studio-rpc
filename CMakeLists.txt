@@ -4,6 +4,10 @@ if(CONFIG_PMW3610)
     target_sources(app PRIVATE src/pmw3610.c)
 endif()
 
+if(CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS)
+    target_sources(app PRIVATE src/settings/pmw3610_settings.c)
+endif()
+
 if(CONFIG_ZMK_PMW3610_STUDIO_RPC)
     # When the driver core is not built (e.g. native_sim with no devicetree
     # node), still provide the public API as a stub returning zero devices so

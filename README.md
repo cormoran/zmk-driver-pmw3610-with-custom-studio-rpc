@@ -17,20 +17,29 @@ features land.
 
 ## Summary
 
-This module currently includes (Phase A):
+This module currently includes (Phase A + Phase B):
 
-- **Firmware**: PMW3610 sensor driver (`src/pmw3610.c`) and a minimal custom
-  Studio RPC handler (`src/studio/pmw3610_handler.c`) exposing sensor
-  presence/diagnostics via `GetInfo`.
-- **Protocol**: Protobuf definition (`proto/cormoran/pmw3610/pmw3610.proto`)
+- **Firmware**: PMW3610 sensor driver (`src/pmw3610.c`) with a
+  runtime-configurable parameter set (cpi, axis flags, force-awake, smart
+  algorithm, downshift/sample times, minimum report interval — see
+  `include/cormoran/pmw3610/pmw3610_api.h`), a custom Studio RPC handler
+  (`src/studio/pmw3610_handler.c`) exposing sensor info/diagnostics/raw
+  register access, and an optional settings integration
+  (`src/settings/pmw3610_settings.c`) via
+  [zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings).
+- **Protocol**: Protobuf definition (`proto/cormoran/pmw3610/pmw3610.proto`) —
+  `GetInfo` (per-device info + runtime config snapshot), `ReadDiagnostics`,
+  `ReadRegister`/`WriteRegister`.
 - **Web UI**: React + TypeScript app (`web/`) using
   [@cormoran/zmk-studio-react-hook](https://github.com/cormoran/react-zmk-studio)
+  (still the minimal Phase A demo UI; a full settings/diagnostics panel is
+  planned for Phase C).
 - **Tests**: Firmware unit tests (`tests/studio/`) and build tests
-  (`tests/zmk-config/`)
+  (`tests/zmk-config/`), including a `pmw3610_settings_rpc` artifact that
+  builds with custom settings enabled.
 
-Planned next: runtime-configurable settings via
-[zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings),
-raw register access, frame (image) capture streaming, and a full web UI.
+Planned next (Phase C): frame (image) capture streaming RPC and a full web UI
+(settings panel + frame viewer).
 
 ## More Info
 
@@ -70,16 +79,89 @@ For more info on modules, you can read through through the [Zephyr modules page]
    CONFIG_INPUT=y
    CONFIG_ZMK_POINTING=y
 
-   # Optionally enable custom Studio RPC diagnostics
+   # Optionally enable custom Studio RPC (sensor info/diagnostics/raw register access)
    CONFIG_ZMK_STUDIO=y
    CONFIG_ZMK_PMW3610_STUDIO_RPC=y
+
+   # Optionally enable runtime settings (cpi, axis flags, downshift/sample
+   # times, etc; requires the zmk-feature-custom-settings module dependency,
+   # see its README for adding it to west.yml)
+   CONFIG_ZMK_CUSTOM_SETTINGS=y
+   CONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC=y
+   CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y
+
+   # Raise Studio RPC buffers: 256 for chunked responses (frame capture is
+   # planned for a later phase but the buffer should already be sized for
+   # it), 128 for custom settings requests/exports.
    CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE=256
+   CONFIG_ZMK_STUDIO_RPC_RX_BUF_SIZE=128
    ```
 
 3. Explore the protocol / firmware handler / web UI:
    - `proto/cormoran/pmw3610/pmw3610.proto` — message types
    - `src/studio/pmw3610_handler.c` — firmware RPC handler
+   - `src/settings/pmw3610_settings.c` — runtime settings integration
    - `web/src/App.tsx` — web UI
+
+### Runtime settings (`cormoran__pmw3610` custom settings)
+
+With `CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y`, the following keys are
+registered (all public/unsecured, readable and writable over the generic
+custom-settings Studio RPC subsystem provided by
+[zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings)):
+
+| key | type | default | valid range |
+| --- | --- | --- | --- |
+| `cpi` | int32 | 600 | 200 – 3200 |
+| `swap_xy` | bool | `CONFIG_PMW3610_SWAP_XY` | — |
+| `invert_x` | bool | `CONFIG_PMW3610_INVERT_X` | — |
+| `invert_y` | bool | `CONFIG_PMW3610_INVERT_Y` | — |
+| `force_awake` | bool | `false` | — |
+| `smart_algorithm` | bool | `CONFIG_PMW3610_SMART_ALGORITHM` | — |
+| `run_downshift_ms` | int32 | `CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS` | 32 – 8160 |
+| `rest1_downshift_ms` | int32 | `CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS` | `16*sample` – `255*16*sample`, using the *default* `rest1_sample_ms` |
+| `rest2_downshift_ms` | int32 | `CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS` | `128*sample` – `255*128*sample`, using the *default* `rest2_sample_ms` |
+| `rest1_sample_ms` | int32 | `CONFIG_PMW3610_REST1_SAMPLE_TIME_MS` | 10 – 2550 |
+| `rest2_sample_ms` | int32 | `CONFIG_PMW3610_REST2_SAMPLE_TIME_MS` | 10 – 2550 |
+| `rest3_sample_ms` | int32 | `CONFIG_PMW3610_REST3_SAMPLE_TIME_MS` | 10 – 2550 |
+| `report_interval_min_ms` | int32 | `CONFIG_PMW3610_REPORT_INTERVAL_MIN` | 0 – 1000 |
+
+Notes:
+
+- **`force_awake` default is always `false`**, regardless of any per-device
+  DT `force-awake;` property. A device with `force-awake;` set in DT boots
+  with it enabled, but as soon as `CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS` is
+  enabled, the setting's effective value (`false` unless you change it) is
+  applied during sensor init and overrides the DT default. If you want
+  force-awake on by default with custom settings enabled, either change a
+  persisted value once (it'll survive reboots), or set the `force_awake`
+  setting via Studio RPC / the settings export/import mechanism.
+- The `rest1_downshift_ms`/`rest2_downshift_ms` **range constraints are
+  computed from the default sample time**, but the sensor's actual valid
+  range at any given moment depends on the *current* `rest1_sample_ms` /
+  `rest2_sample_ms` value. If you change the sample time first, a downshift
+  value that passed the setting's static range check may still be rejected
+  by the driver (and vice versa) — change sample time and downshift time
+  together if you push both away from their defaults.
+- Changes take effect immediately (pushed to the sensor over SPI as soon as
+  it has finished async init) and are re-applied to all PMW3610 devices
+  whenever any `cormoran__pmw3610` setting changes (save, discard, or
+  reset).
+- Settings persistence/export/import (`get`/`set`/`save`/`discard`/`reset`)
+  is handled generically by zmk-feature-custom-settings' own Studio RPC
+  subsystem, not duplicated here — see that module's README/web app for the
+  matching client-side patterns.
+
+### RPC debug facilities
+
+The `WriteRegister` RPC call writes an arbitrary sensor register with no
+validation beyond fitting in a byte. It exists to tune the (currently
+undocumented-by-datasheet) frame-capture procedure planned for Phase C
+without reflashing, but it can just as easily put the sensor in a bad state
+until the next power-up reset / reconfigure. The subsystem is unsecured
+(matching this module's template default) — treat access to it like access
+to a debug/JTAG interface: fine for your own trusted host, not something to
+expose over an untrusted transport.
 
 ### Web UI
 

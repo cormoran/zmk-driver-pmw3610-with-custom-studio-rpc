@@ -11,9 +11,11 @@
 #include <zephyr/input/input.h>
 #include <zephyr/pm/device.h>
 #include <zmk/keymap.h>
+#include <zmk/activity.h>
 #include <zmk/events/activity_state_changed.h>
 #include "pmw3610.h"
 #include <cormoran/pmw3610/pmw3610_api.h>
+#include <cormoran/pmw3610/pmw3610_settings_apply.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
@@ -109,7 +111,8 @@ static int pmw3610_write(const struct device *dev, uint8_t reg, uint8_t val) {
     return 0;
 }
 
-static int pmw3610_set_cpi(const struct device *dev, uint32_t cpi) {
+/* Caller must hold data->lock (composite multi-write sequence). */
+static int pmw3610_set_cpi_locked(const struct device *dev, uint32_t cpi) {
     /* Set resolution with CPI step of 200 cpi
      * 0x1: 200 cpi (minimum cpi)
      * 0x2: 400 cpi
@@ -174,10 +177,15 @@ static int pmw3610_set_sample_time(const struct device *dev, uint8_t reg_addr,
     return err;
 }
 
-/* Set downshift time in ms. */
-// NOTE: The unit of run-mode downshift is related to pos mode rate, which is hard coded to be 4 ms
-// The pos-mode rate is configured in pmw3610_async_init_configure
-static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr, uint32_t time) {
+/* Set downshift time in ms.
+ *
+ * NOTE: The unit of run-mode downshift is related to pos mode rate, which is
+ * hard coded to be 4 ms (configured in pmw3610_async_init_configure). The
+ * unit of rest1/rest2 downshift depends on the *current* rest1/rest2 sample
+ * time respectively, so the caller passes the currently configured sample
+ * time in `sample_time_ms` (unused for PMW3610_REG_RUN_DOWNSHIFT). */
+static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr, uint32_t time,
+                                      uint32_t sample_time_ms) {
     uint32_t maxtime;
     uint32_t mintime;
 
@@ -196,8 +204,8 @@ static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr
          * Rest1 downshift time = PMW3610_REG_RUN_DOWNSHIFT
          *                        * 16 * Rest1_sample_period (default 40 ms)
          */
-        maxtime = 255 * 16 * CONFIG_PMW3610_REST1_SAMPLE_TIME_MS;
-        mintime = 16 * CONFIG_PMW3610_REST1_SAMPLE_TIME_MS;
+        maxtime = 255 * 16 * sample_time_ms;
+        mintime = 16 * sample_time_ms;
         break;
 
     case PMW3610_REG_REST2_DOWNSHIFT:
@@ -205,8 +213,8 @@ static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr
          * Rest2 downshift time = PMW3610_REG_REST2_DOWNSHIFT
          *                        * 128 * Rest2 rate (default 100 ms)
          */
-        maxtime = 255 * 128 * CONFIG_PMW3610_REST2_SAMPLE_TIME_MS;
-        mintime = 128 * CONFIG_PMW3610_REST2_SAMPLE_TIME_MS;
+        maxtime = 255 * 128 * sample_time_ms;
+        mintime = 128 * sample_time_ms;
         break;
 
     default:
@@ -234,11 +242,18 @@ static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr
     return err;
 }
 
-static int pmw3610_set_performance(const struct device *dev, bool enabled) {
-    const struct pixart_config *config = dev->config;
+/* Set the performance (force-awake) register.
+ *
+ * `force_awake_runtime` reflects the current runtime force-awake flag (from
+ * pixart_data.runtime.force_awake, which may differ from the DT
+ * force-awake property once changed via settings/RPC). When disabled, the
+ * performance register is left untouched (matches previous behavior where
+ * config->force_awake gated the whole function). */
+static int pmw3610_set_performance(const struct device *dev, bool force_awake_runtime,
+                                   bool enabled) {
     int err = 0;
 
-    if (config->force_awake) {
+    if (force_awake_runtime) {
         uint8_t value;
         err = pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &value);
         if (err) {
@@ -316,7 +331,7 @@ static int pmw3610_async_init_check_ob1(const struct device *dev) {
 
 static int pmw3610_async_init_configure(const struct device *dev) {
     int err = 0;
-    const struct pixart_config *config = dev->config;
+    struct pixart_data *data = dev->data;
 
     // clear motion registers first (required in datasheet)
     for (uint8_t reg = 0x02; (reg <= 0x05) && !err; reg++) {
@@ -324,42 +339,55 @@ static int pmw3610_async_init_configure(const struct device *dev) {
         err = pmw3610_read_reg(dev, reg, buf);
     }
 
+    // Overlay persisted/effective custom-setting values onto the runtime
+    // config before it is applied to hardware below. This runs strictly
+    // after main()'s settings_load() has returned (see
+    // pmw3610_settings_apply.h for why there is no boot-ordering race),
+    // and before `data->ready` is set, so the immediate-push branches in
+    // the pmw3610_set_* setters are no-ops here -- only the in-memory
+    // struct is updated, then applied once below.
+    if (IS_ENABLED(CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS)) {
+        pmw3610_settings_apply_to_device(dev);
+    }
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    struct pixart_runtime_config rt = data->runtime;
+    k_mutex_unlock(&data->lock);
+
     if (!err) {
-        err = pmw3610_set_performance(dev, true);
+        err = pmw3610_set_performance(dev, rt.force_awake, true);
     }
 
     if (!err) {
-        err = pmw3610_set_cpi(dev, config->cpi);
+        k_mutex_lock(&data->lock, K_FOREVER);
+        err = pmw3610_set_cpi_locked(dev, rt.cpi);
+        k_mutex_unlock(&data->lock);
     }
 
     if (!err) {
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_RUN_DOWNSHIFT,
-                                         CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS);
+        err = pmw3610_set_downshift_time(dev, PMW3610_REG_RUN_DOWNSHIFT, rt.run_downshift_ms, 0);
     }
 
     if (!err) {
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST1_DOWNSHIFT,
-                                         CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS);
+        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST1_DOWNSHIFT, rt.rest1_downshift_ms,
+                                         rt.rest1_sample_ms);
     }
 
     if (!err) {
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST2_DOWNSHIFT,
-                                         CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS);
+        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST2_DOWNSHIFT, rt.rest2_downshift_ms,
+                                         rt.rest2_sample_ms);
     }
 
     if (!err) {
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST1_RATE,
-                                      CONFIG_PMW3610_REST1_SAMPLE_TIME_MS);
+        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST1_RATE, rt.rest1_sample_ms);
     }
 
     if (!err) {
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST2_RATE,
-                                      CONFIG_PMW3610_REST2_SAMPLE_TIME_MS);
+        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST2_RATE, rt.rest2_sample_ms);
     }
 
     if (!err) {
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST3_RATE,
-                                      CONFIG_PMW3610_REST3_SAMPLE_TIME_MS);
+        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST3_RATE, rt.rest3_sample_ms);
     }
 
     if (err) {
@@ -417,14 +445,12 @@ static int pmw3610_report_data(const struct device *dev) {
         return -EBUSY;
     }
 
-    static int64_t dx = 0;
-    static int64_t dy = 0;
+    k_mutex_lock(&data->lock, K_FOREVER);
+    struct pixart_runtime_config rt = data->runtime;
+    k_mutex_unlock(&data->lock);
 
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-    static int64_t last_smp_time = 0;
-    static int64_t last_rpt_time = 0;
+    uint32_t report_interval_min_ms = rt.report_interval_min_ms;
     int64_t now = k_uptime_get();
-#endif
 
     if (!config->disable_burst_read) {
         // Burst mode requires cs pin to reset
@@ -450,63 +476,63 @@ static int pmw3610_report_data(const struct device *dev) {
     int16_t y = TOINT16((buf[PMW3610_Y_L_POS] + ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
     LOG_DBG("x/y: %d/%d", x, y);
 
-#if IS_ENABLED(CONFIG_PMW3610_SWAP_XY)
-    int16_t a = x;
-    x = y;
-    y = a;
-#endif
-#if IS_ENABLED(CONFIG_PMW3610_INVERT_X)
-    x = -x;
-#endif
-#if IS_ENABLED(CONFIG_PMW3610_INVERT_Y)
-    y = -y;
-#endif
+    if (rt.swap_xy) {
+        int16_t a = x;
+        x = y;
+        y = a;
+    }
+    if (rt.invert_x) {
+        x = -x;
+    }
+    if (rt.invert_y) {
+        y = -y;
+    }
 
-#ifdef CONFIG_PMW3610_SMART_ALGORITHM
-    int16_t shutter =
-        ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) + buf[PMW3610_SHUTTER_L_POS];
-    if (data->sw_smart_flag && shutter < 45) {
-        pmw3610_write(dev, 0x32, 0x00);
-        data->sw_smart_flag = false;
+    if (rt.smart_algorithm) {
+        int16_t shutter =
+            ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) + buf[PMW3610_SHUTTER_L_POS];
+        if (data->sw_smart_flag && shutter < 45) {
+            pmw3610_write(dev, 0x32, 0x00);
+            data->sw_smart_flag = false;
+        }
+        if (!data->sw_smart_flag && shutter > 45) {
+            pmw3610_write(dev, 0x32, 0x80);
+            data->sw_smart_flag = true;
+        }
     }
-    if (!data->sw_smart_flag && shutter > 45) {
-        pmw3610_write(dev, 0x32, 0x80);
-        data->sw_smart_flag = true;
-    }
-#endif
 
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-    // purge accumulated delta, if last sampled had not been reported on last report tick
-    if (now - last_smp_time >= CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
-        dx = 0;
-        dy = 0;
+    if (report_interval_min_ms > 0) {
+        // purge accumulated delta, if last sampled had not been reported on last report tick
+        if (now - data->last_smp_time >= report_interval_min_ms) {
+            data->dx = 0;
+            data->dy = 0;
+        }
+        data->last_smp_time = now;
     }
-    last_smp_time = now;
-#endif
 
     // accumulate delta until report in next iteration
-    dx += x;
-    dy += y;
+    data->dx += x;
+    data->dy += y;
 
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-    // strict to report inerval
-    if (now - last_rpt_time < CONFIG_PMW3610_REPORT_INTERVAL_MIN) {
-        return 0;
+    if (report_interval_min_ms > 0) {
+        // strict to report inerval
+        if (now - data->last_rpt_time < report_interval_min_ms) {
+            return 0;
+        }
     }
-#endif
 
     // fetch report value
-    int16_t rx = (int16_t)CLAMP(dx, INT16_MIN, INT16_MAX);
-    int16_t ry = (int16_t)CLAMP(dy, INT16_MIN, INT16_MAX);
+    int16_t rx = (int16_t)CLAMP(data->dx, INT16_MIN, INT16_MAX);
+    int16_t ry = (int16_t)CLAMP(data->dy, INT16_MIN, INT16_MAX);
     bool have_x = rx != 0;
     bool have_y = ry != 0;
 
     if (have_x || have_y) {
-#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0
-        last_rpt_time = now;
-#endif
-        dx = 0;
-        dy = 0;
+        if (report_interval_min_ms > 0) {
+            data->last_rpt_time = now;
+        }
+        data->dx = 0;
+        data->dy = 0;
         if (have_x) {
             input_report(dev, config->evt_type, config->x_input_code, rx, !have_y, K_NO_WAIT);
         }
@@ -598,6 +624,33 @@ static int pmw3610_init(const struct device *dev) {
     // init smart algorithm flag;
     data->sw_smart_flag = false;
 
+    k_mutex_init(&data->lock);
+
+    // Seed runtime config from Kconfig/DT defaults. When
+    // CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS is enabled, the settings module
+    // overwrites these fields (before async init completes, or immediately
+    // via the setters once it does) with the persisted/effective setting
+    // values.
+    data->runtime = (struct pixart_runtime_config){
+        .cpi = config->cpi,
+        .swap_xy = IS_ENABLED(CONFIG_PMW3610_SWAP_XY),
+        .invert_x = IS_ENABLED(CONFIG_PMW3610_INVERT_X),
+        .invert_y = IS_ENABLED(CONFIG_PMW3610_INVERT_Y),
+        .force_awake = config->force_awake,
+        .smart_algorithm = IS_ENABLED(CONFIG_PMW3610_SMART_ALGORITHM),
+        .run_downshift_ms = CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS,
+        .rest1_downshift_ms = CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS,
+        .rest2_downshift_ms = CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS,
+        .rest1_sample_ms = CONFIG_PMW3610_REST1_SAMPLE_TIME_MS,
+        .rest2_sample_ms = CONFIG_PMW3610_REST2_SAMPLE_TIME_MS,
+        .rest3_sample_ms = CONFIG_PMW3610_REST3_SAMPLE_TIME_MS,
+        .report_interval_min_ms = CONFIG_PMW3610_REPORT_INTERVAL_MIN,
+    };
+    data->dx = 0;
+    data->dy = 0;
+    data->last_smp_time = 0;
+    data->last_rpt_time = 0;
+
     // init trigger handler work
     k_work_init(&data->trigger_work, pmw3610_work_callback);
 
@@ -634,34 +687,31 @@ static int pmw3610_attr_set(const struct device *dev, enum sensor_channel chan,
 
     switch ((uint32_t)attr) {
     case PMW3610_ATTR_CPI:
-        err = pmw3610_set_cpi(dev, PMW3610_SVALUE_TO_CPI(*val));
+        err = pmw3610_set_cpi_runtime(dev, PMW3610_SVALUE_TO_CPI(*val));
         break;
 
     case PMW3610_ATTR_RUN_DOWNSHIFT_TIME:
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_RUN_DOWNSHIFT,
-                                         PMW3610_SVALUE_TO_TIME(*val));
+        err = pmw3610_set_run_downshift_ms(dev, PMW3610_SVALUE_TO_TIME(*val));
         break;
 
     case PMW3610_ATTR_REST1_DOWNSHIFT_TIME:
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST1_DOWNSHIFT,
-                                         PMW3610_SVALUE_TO_TIME(*val));
+        err = pmw3610_set_rest1_downshift_ms(dev, PMW3610_SVALUE_TO_TIME(*val));
         break;
 
     case PMW3610_ATTR_REST2_DOWNSHIFT_TIME:
-        err = pmw3610_set_downshift_time(dev, PMW3610_REG_REST2_DOWNSHIFT,
-                                         PMW3610_SVALUE_TO_TIME(*val));
+        err = pmw3610_set_rest2_downshift_ms(dev, PMW3610_SVALUE_TO_TIME(*val));
         break;
 
     case PMW3610_ATTR_REST1_SAMPLE_TIME:
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST1_RATE, PMW3610_SVALUE_TO_TIME(*val));
+        err = pmw3610_set_rest1_sample_ms(dev, PMW3610_SVALUE_TO_TIME(*val));
         break;
 
     case PMW3610_ATTR_REST2_SAMPLE_TIME:
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST2_RATE, PMW3610_SVALUE_TO_TIME(*val));
+        err = pmw3610_set_rest2_sample_ms(dev, PMW3610_SVALUE_TO_TIME(*val));
         break;
 
     case PMW3610_ATTR_REST3_SAMPLE_TIME:
-        err = pmw3610_set_sample_time(dev, PMW3610_REG_REST3_RATE, PMW3610_SVALUE_TO_TIME(*val));
+        err = pmw3610_set_rest3_sample_ms(dev, PMW3610_SVALUE_TO_TIME(*val));
         break;
 
     default:
@@ -755,7 +805,15 @@ static int on_activity_state(const zmk_event_t *eh) {
     bool enable = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 1 : 0;
     LOG_DBG("Change PMW3610 performance to %s", enable ? "active" : "inactive");
     for (size_t i = 0; i < ARRAY_SIZE(pmw3610_devs); i++) {
-        pmw3610_set_performance(pmw3610_devs[i], enable);
+        const struct device *dev = pmw3610_devs[i];
+        struct pixart_data *data = dev->data;
+        if (!data->ready) {
+            continue;
+        }
+        k_mutex_lock(&data->lock, K_FOREVER);
+        bool force_awake = data->runtime.force_awake;
+        k_mutex_unlock(&data->lock);
+        pmw3610_set_performance(dev, force_awake, enable);
     }
 
     return 0;
@@ -796,4 +854,272 @@ int pmw3610_read_register(const struct device *dev, uint8_t addr, uint8_t *value
         return -ENODEV;
     }
     return pmw3610_read_reg(dev, addr, value);
+}
+
+int pmw3610_write_register(const struct device *dev, uint8_t addr, uint8_t value) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+    k_mutex_lock(&data->lock, K_FOREVER);
+    int err = pmw3610_write(dev, addr, value);
+    k_mutex_unlock(&data->lock);
+    return err;
+}
+
+int pmw3610_read_diagnostics(const struct device *dev, struct pmw3610_diagnostics *out) {
+    if (!dev || !out) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+    if (!data->ready) {
+        return -EBUSY;
+    }
+
+    uint8_t squal, shutter_hi, shutter_lo, pix_max, pix_avg, pix_min;
+    int err;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    do {
+        if ((err = pmw3610_read_reg(dev, PMW3610_REG_SQUAL, &squal)) != 0) {
+            break;
+        }
+        if ((err = pmw3610_read_reg(dev, PMW3610_REG_SHUTTER_HIGHER, &shutter_hi)) != 0) {
+            break;
+        }
+        if ((err = pmw3610_read_reg(dev, PMW3610_REG_SHUTTER_LOWER, &shutter_lo)) != 0) {
+            break;
+        }
+        if ((err = pmw3610_read_reg(dev, PMW3610_REG_PIX_MAX, &pix_max)) != 0) {
+            break;
+        }
+        if ((err = pmw3610_read_reg(dev, PMW3610_REG_PIX_AVG, &pix_avg)) != 0) {
+            break;
+        }
+        err = pmw3610_read_reg(dev, PMW3610_REG_PIX_MIN, &pix_min);
+    } while (0);
+    k_mutex_unlock(&data->lock);
+
+    if (err) {
+        return err;
+    }
+
+    out->squal = squal;
+    out->shutter = ((uint16_t)(shutter_hi & 0x01) << 8) + shutter_lo;
+    out->pix_max = pix_max;
+    out->pix_avg = pix_avg;
+    out->pix_min = pix_min;
+    return 0;
+}
+
+int pmw3610_get_runtime_config(const struct device *dev, struct pmw3610_runtime_config *out) {
+    if (!dev || !out) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    struct pixart_runtime_config rt = data->runtime;
+    k_mutex_unlock(&data->lock);
+
+    *out = (struct pmw3610_runtime_config){
+        .cpi = rt.cpi,
+        .swap_xy = rt.swap_xy,
+        .invert_x = rt.invert_x,
+        .invert_y = rt.invert_y,
+        .force_awake = rt.force_awake,
+        .smart_algorithm = rt.smart_algorithm,
+        .run_downshift_ms = rt.run_downshift_ms,
+        .rest1_downshift_ms = rt.rest1_downshift_ms,
+        .rest2_downshift_ms = rt.rest2_downshift_ms,
+        .rest1_sample_ms = rt.rest1_sample_ms,
+        .rest2_sample_ms = rt.rest2_sample_ms,
+        .rest3_sample_ms = rt.rest3_sample_ms,
+        .report_interval_min_ms = rt.report_interval_min_ms,
+    };
+    return 0;
+}
+
+int pmw3610_set_cpi_runtime(const struct device *dev, uint32_t cpi) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    if (cpi < PMW3610_MIN_CPI || cpi > PMW3610_MAX_CPI) {
+        return -EINVAL;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    data->runtime.cpi = cpi;
+    int err = data->ready ? pmw3610_set_cpi_locked(dev, cpi) : 0;
+    k_mutex_unlock(&data->lock);
+    return err;
+}
+
+int pmw3610_set_run_downshift_ms(const struct device *dev, uint32_t value) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    if (value < 32 || value > 8160) {
+        return -EINVAL;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    data->runtime.run_downshift_ms = value;
+    int err =
+        data->ready ? pmw3610_set_downshift_time(dev, PMW3610_REG_RUN_DOWNSHIFT, value, 0) : 0;
+    k_mutex_unlock(&data->lock);
+    return err;
+}
+
+int pmw3610_set_rest1_downshift_ms(const struct device *dev, uint32_t value) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    uint32_t sample_ms = data->runtime.rest1_sample_ms;
+    uint32_t mintime = 16 * sample_ms;
+    uint32_t maxtime = 255 * 16 * sample_ms;
+    if (value < mintime || value > maxtime) {
+        k_mutex_unlock(&data->lock);
+        return -EINVAL;
+    }
+    data->runtime.rest1_downshift_ms = value;
+    int err = data->ready
+                  ? pmw3610_set_downshift_time(dev, PMW3610_REG_REST1_DOWNSHIFT, value, sample_ms)
+                  : 0;
+    k_mutex_unlock(&data->lock);
+    return err;
+}
+
+int pmw3610_set_rest2_downshift_ms(const struct device *dev, uint32_t value) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    uint32_t sample_ms = data->runtime.rest2_sample_ms;
+    uint32_t mintime = 128 * sample_ms;
+    uint32_t maxtime = 255 * 128 * sample_ms;
+    if (value < mintime || value > maxtime) {
+        k_mutex_unlock(&data->lock);
+        return -EINVAL;
+    }
+    data->runtime.rest2_downshift_ms = value;
+    int err = data->ready
+                  ? pmw3610_set_downshift_time(dev, PMW3610_REG_REST2_DOWNSHIFT, value, sample_ms)
+                  : 0;
+    k_mutex_unlock(&data->lock);
+    return err;
+}
+
+static int pmw3610_set_sample_ms_common(const struct device *dev, uint8_t reg_addr,
+                                        uint32_t *runtime_field, uint32_t value) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    if (value < 10 || value > 2550) {
+        return -EINVAL;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    *runtime_field = value;
+    int err = data->ready ? pmw3610_set_sample_time(dev, reg_addr, value) : 0;
+    k_mutex_unlock(&data->lock);
+    return err;
+}
+
+int pmw3610_set_rest1_sample_ms(const struct device *dev, uint32_t value) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+    return pmw3610_set_sample_ms_common(dev, PMW3610_REG_REST1_RATE, &data->runtime.rest1_sample_ms,
+                                        value);
+}
+
+int pmw3610_set_rest2_sample_ms(const struct device *dev, uint32_t value) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+    return pmw3610_set_sample_ms_common(dev, PMW3610_REG_REST2_RATE, &data->runtime.rest2_sample_ms,
+                                        value);
+}
+
+int pmw3610_set_rest3_sample_ms(const struct device *dev, uint32_t value) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+    return pmw3610_set_sample_ms_common(dev, PMW3610_REG_REST3_RATE, &data->runtime.rest3_sample_ms,
+                                        value);
+}
+
+int pmw3610_set_axis_flags(const struct device *dev, bool swap_xy, bool invert_x, bool invert_y) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    data->runtime.swap_xy = swap_xy;
+    data->runtime.invert_x = invert_x;
+    data->runtime.invert_y = invert_y;
+    k_mutex_unlock(&data->lock);
+    return 0;
+}
+
+int pmw3610_set_force_awake(const struct device *dev, bool enabled) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+
+    /* Reflect current keyboard activity state: force-awake only takes
+     * effect while ZMK considers the keyboard active (matches
+     * on_activity_state()'s existing behavior; this is not itself an
+     * activity-state change, just an immediate re-application of it). */
+    bool active = zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    data->runtime.force_awake = enabled;
+    int err = data->ready ? pmw3610_set_performance(dev, enabled, active) : 0;
+    k_mutex_unlock(&data->lock);
+    return err;
+}
+
+int pmw3610_set_smart_algorithm(const struct device *dev, bool enabled) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    data->runtime.smart_algorithm = enabled;
+    if (!enabled) {
+        data->sw_smart_flag = false;
+    }
+    k_mutex_unlock(&data->lock);
+    return 0;
+}
+
+int pmw3610_set_report_interval_min(const struct device *dev, uint32_t value_ms) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    if (value_ms > 1000) {
+        return -EINVAL;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    data->runtime.report_interval_min_ms = value_ms;
+    k_mutex_unlock(&data->lock);
+    return 0;
 }
