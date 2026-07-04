@@ -163,17 +163,18 @@ For more info on modules, you can read through through the [Zephyr modules page]
 ### Runtime settings (`cormoran__pmw3610` custom settings)
 
 With `CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y`, the following keys are
-registered (all public/unsecured, readable and writable over the generic
+registered **once per PMW3610 devicetree instance**, as `"<param>@<id>"`
+(all public/unsecured, readable and writable over the generic
 custom-settings Studio RPC subsystem provided by
 [zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings)):
 
-| key | type | default | valid range |
+| param | type | default | valid range |
 | --- | --- | --- | --- |
-| `cpi` | int32 | 600 | 200 – 3200 |
+| `cpi` | int32 | this device's DT `cpi` property (600 if unset) | 200 – 3200 |
 | `swap_xy` | bool | `CONFIG_PMW3610_SWAP_XY` | — |
 | `invert_x` | bool | `CONFIG_PMW3610_INVERT_X` | — |
 | `invert_y` | bool | `CONFIG_PMW3610_INVERT_Y` | — |
-| `force_awake` | bool | `false` | — |
+| `force_awake` | bool | this device's DT `force-awake` property (`false` if unset) | — |
 | `smart_algorithm` | bool | `CONFIG_PMW3610_SMART_ALGORITHM` | — |
 | `run_downshift_ms` | int32 | `CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS` | 32 – 8160 |
 | `rest1_downshift_ms` | int32 | `CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS` | `16*sample` – `255*16*sample`, using the *default* `rest1_sample_ms` |
@@ -183,16 +184,25 @@ custom-settings Studio RPC subsystem provided by
 | `rest3_sample_ms` | int32 | `CONFIG_PMW3610_REST3_SAMPLE_TIME_MS` | 10 – 2550 |
 | `report_interval_min_ms` | int32 | `CONFIG_PMW3610_REPORT_INTERVAL_MIN` | 0 – 1000 |
 
+**`<id>`** is this device's `settings_id`, reported per-device in `GetInfo`
+(`DeviceInfo.settings_id`): the devicetree `settings-id` property if set
+(recommended, up to 8 ASCII characters, e.g. `settings-id = "trackball";`),
+otherwise a 4-hex-digit hash of the devicetree node's path (stable across
+reordering of sibling devicetree nodes, but not human-readable — set
+`settings-id` explicitly if you want a readable key, e.g. with more than one
+PMW3610 device in one firmware image). A single-sensor board without
+`settings-id` set ends up with keys like `cpi@a3f2`; with `settings-id =
+"trackball"` it would be `cpi@trackball`.
+
 Notes:
 
-- **`force_awake` default is always `false`**, regardless of any per-device
-  DT `force-awake;` property. A device with `force-awake;` set in DT boots
-  with it enabled, but as soon as `CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS` is
-  enabled, the setting's effective value (`false` unless you change it) is
-  applied during sensor init and overrides the DT default. If you want
-  force-awake on by default with custom settings enabled, either change a
-  persisted value once (it'll survive reboots), or set the `force_awake`
-  setting via Studio RPC / the settings export/import mechanism.
+- **Each device's settings are independent.** With two PMW3610 devices in
+  one firmware image (e.g. a split keyboard's central *and* peripheral each
+  having a sensor, or two sensors on one half), changing `cpi@<id>` for one
+  device does not affect the other's `cpi@<other-id>`.
+- `force_awake` and `cpi` default to **this device's own devicetree
+  properties** (`force-awake;` / `cpi = <...>;`), not a single value shared
+  by every device.
 - The `rest1_downshift_ms`/`rest2_downshift_ms` **range constraints are
   computed from the default sample time**, but the sensor's actual valid
   range at any given moment depends on the *current* `rest1_sample_ms` /
@@ -203,7 +213,8 @@ Notes:
 - Changes take effect immediately (pushed to the sensor over SPI as soon as
   it has finished async init) and are re-applied to all PMW3610 devices
   whenever any `cormoran__pmw3610` setting changes (save, discard, or
-  reset).
+  reset) — each device only ever reads its own `"<param>@<id>"` keys, so
+  this is harmless for devices unrelated to the change.
 - Settings persistence/export/import (`get`/`set`/`save`/`discard`/`reset`)
   is handled generically by zmk-feature-custom-settings' own Studio RPC
   subsystem, not duplicated here — see that module's README/web app for the

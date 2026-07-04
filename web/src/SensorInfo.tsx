@@ -142,9 +142,10 @@ export function SensorInfo() {
                 value={selectedDevice}
                 onChange={(e) => setSelectedDevice(Number(e.target.value))}
               >
-                {devices.map((_, i) => (
+                {devices.map((d, i) => (
                   <option key={i} value={i}>
                     {i}
+                    {d.settingsId ? ` (${d.settingsId})` : ""}
                   </option>
                 ))}
               </select>
@@ -160,6 +161,10 @@ export function SensorInfo() {
 
         {device ? (
           <dl className="setting-summary">
+            <div>
+              <dt>Settings ID</dt>
+              <dd>{device.settingsId || "(none)"}</dd>
+            </div>
             <div>
               <dt>Ready</dt>
               <dd>{device.ready ? "yes" : "no"}</dd>

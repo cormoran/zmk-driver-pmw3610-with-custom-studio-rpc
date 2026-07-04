@@ -8,18 +8,21 @@
  * @file pmw3610_settings.c
  *
  * @brief Registers PMW3610 sensor parameters as custom settings (subsystem
- * "cormoran__pmw3610"), and keeps every PMW3610 device's runtime config in
- * sync with the effective setting values:
+ * "cormoran__pmw3610"), one independent set of keys per devicetree instance
+ * ("<param>@<settings-id>", see pmw3610_settings_id.h), and keeps each
+ * PMW3610 device's runtime config in sync with its own effective setting
+ * values:
  *
  *  - At boot: pmw3610_settings_apply_to_device() is called by the driver
  *    itself from pmw3610_async_init_configure() (see
  *    include/cormoran/pmw3610/pmw3610_settings_apply.h for why that call
  *    site -- rather than a SYS_INIT hook here -- avoids a boot-ordering
  *    race against zmk-feature-custom-settings' own settings_load()).
- *  - At runtime: a zmk_custom_setting_changed listener re-applies the
- *    changed key's current effective value to all PMW3610 devices,
- *    covering VALUE_UPDATED / SAVED / DISCARDED / RESET alike (all of them
- *    just mean "re-read the effective value and push it").
+ *  - At runtime: a zmk_custom_setting_changed listener re-applies every
+ *    device's current effective values (each device only ever reads its
+ *    own per-device keys, so this is "wasteful but correct", not
+ *    "wrong") -- covers VALUE_UPDATED / SAVED / DISCARDED / RESET alike
+ *    (all of them just mean "re-read the effective value and push it").
  *
  * The generic get/set/save/discard/reset/export RPC surface for these
  * settings is provided by zmk-feature-custom-settings' own Studio RPC
@@ -27,18 +30,33 @@
  * it does not implement any RPC itself.
  */
 
+#include <stdio.h>
 #include <string.h>
+
+#include <zephyr/devicetree.h>
+#include <zephyr/init.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/util.h>
 
 #include <cormoran/zmk/custom_settings.h>
 #include <cormoran/pmw3610/pmw3610_api.h>
 #include <cormoran/pmw3610/pmw3610_settings_apply.h>
+#include <cormoran/pmw3610/pmw3610_settings_id.h>
 
 #include <zmk/event_manager.h>
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+#define DT_DRV_COMPAT cormoran_pmw3610
+
 #define PMW3610_SETTINGS_SUBSYSTEM_ID "cormoran__pmw3610"
+
+/* Longest field name is "report_interval_min_ms" (23 chars) + '@' (1) + up
+ * to PMW3610_SETTINGS_ID_MAX_LEN (8) id chars + NUL (1) = 33; sized with
+ * headroom. Comfortably under CONFIG_ZMK_CUSTOM_SETTINGS_KEY_MAX_LEN
+ * (default 48). */
+#define PMW3610_SETTINGS_KEY_BUF_SIZE 40
 
 /* The CONFIG_PMW3610_* Kconfig symbols below only exist `if PMW3610` (see
  * Kconfig) -- this settings module itself is usable with zero PMW3610
@@ -163,7 +181,7 @@ static const struct zmk_custom_setting_constraint pmw3610_report_interval_constr
 #define PMW3610_SETTING_INT32(_name, _key, _default, _constraint)                                  \
     STRUCT_SECTION_ITERABLE(zmk_custom_setting, _name) = {                                         \
         .custom_subsystem_id = PMW3610_SETTINGS_SUBSYSTEM_ID,                                      \
-        .key = _key,                                                                               \
+        .key = (_key),                                                                             \
         .array_index = ZMK_CUSTOM_SETTING_ARRAY_NONE,                                              \
         .value_type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,                                         \
         .confidentiality = ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,                          \
@@ -177,7 +195,7 @@ static const struct zmk_custom_setting_constraint pmw3610_report_interval_constr
 #define PMW3610_SETTING_BOOL(_name, _key, _default)                                                \
     STRUCT_SECTION_ITERABLE(zmk_custom_setting, _name) = {                                         \
         .custom_subsystem_id = PMW3610_SETTINGS_SUBSYSTEM_ID,                                      \
-        .key = _key,                                                                               \
+        .key = (_key),                                                                             \
         .array_index = ZMK_CUSTOM_SETTING_ARRAY_NONE,                                              \
         .value_type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL,                                          \
         .confidentiality = ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,                          \
@@ -188,47 +206,136 @@ static const struct zmk_custom_setting_constraint pmw3610_report_interval_constr
         .default_value = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL, .bool_value = (_default)},   \
     }
 
-/* DT default cpi is 600 (dts/bindings/cormoran,pmw3610.yml). Devices with a
- * different DT `cpi` still boot with their own DT value until this setting
- * is written -- pmw3610_settings_apply_to_device() only overlays a setting
- * once its `initialized` flag is set (see zmk_custom_setting.initialized in
- * custom_settings.c), which is true from early boot, so in practice all
- * devices converge on this single global cpi setting immediately. This
- * matches the single-shared-setting design in DESIGN.md (one physical
- * sensor per board is the common case). */
-PMW3610_SETTING_INT32(pmw3610_setting_cpi, "cpi", 600, pmw3610_cpi_constraint);
-PMW3610_SETTING_BOOL(pmw3610_setting_swap_xy, "swap_xy", IS_ENABLED(CONFIG_PMW3610_SWAP_XY));
-PMW3610_SETTING_BOOL(pmw3610_setting_invert_x, "invert_x", IS_ENABLED(CONFIG_PMW3610_INVERT_X));
-PMW3610_SETTING_BOOL(pmw3610_setting_invert_y, "invert_y", IS_ENABLED(CONFIG_PMW3610_INVERT_Y));
-PMW3610_SETTING_BOOL(pmw3610_setting_force_awake, "force_awake", false);
-PMW3610_SETTING_BOOL(pmw3610_setting_smart_algorithm, "smart_algorithm",
-                     IS_ENABLED(CONFIG_PMW3610_SMART_ALGORITHM));
-PMW3610_SETTING_INT32(pmw3610_setting_run_downshift_ms, "run_downshift_ms",
-                      CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS, pmw3610_run_downshift_constraint);
-PMW3610_SETTING_INT32(pmw3610_setting_rest1_downshift_ms, "rest1_downshift_ms",
-                      CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS, pmw3610_rest1_downshift_constraint);
-PMW3610_SETTING_INT32(pmw3610_setting_rest2_downshift_ms, "rest2_downshift_ms",
-                      CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS, pmw3610_rest2_downshift_constraint);
-PMW3610_SETTING_INT32(pmw3610_setting_rest1_sample_ms, "rest1_sample_ms",
-                      PMW3610_DEFAULT_REST1_SAMPLE_MS, pmw3610_sample_ms_constraint);
-PMW3610_SETTING_INT32(pmw3610_setting_rest2_sample_ms, "rest2_sample_ms",
-                      PMW3610_DEFAULT_REST2_SAMPLE_MS, pmw3610_sample_ms_constraint);
-PMW3610_SETTING_INT32(pmw3610_setting_rest3_sample_ms, "rest3_sample_ms",
-                      CONFIG_PMW3610_REST3_SAMPLE_TIME_MS, pmw3610_sample_ms_constraint);
-PMW3610_SETTING_INT32(pmw3610_setting_report_interval_min_ms, "report_interval_min_ms",
-                      CONFIG_PMW3610_REPORT_INTERVAL_MIN, pmw3610_report_interval_constraint);
+/* --- Per-instance key storage + settings entries ----------------------- */
+/*
+ * One settings entry set per devicetree instance ("<param>@<id>"), instead
+ * of one global set shared by every PMW3610 device. Each entry's `.key`
+ * points at a per-instance static buffer (content filled at boot, before
+ * settings_load(), by PMW3610_INIT_INST_KEYS below) rather than a string
+ * literal -- `struct zmk_custom_setting.key` is `const char *`, so a mutable
+ * buffer works exactly like a literal from every other call site's point of
+ * view.
+ *
+ * `n` below is a compile-time devicetree instance index (from
+ * DT_INST_FOREACH_STATUS_OKAY), not a runtime value -- token-pasted into
+ * unique per-instance symbol names.
+ */
 
-/* NOTE: force_awake's setting default above is `false`, independent of any
- * DT `force-awake` property, because a custom setting default must be a
- * compile-time constant shared by all devices, while `force-awake` is a
- * per-device DT property. A device that sets `force-awake;` in DT still
- * boots with force-awake enabled (seeded in pmw3610_init()) until this
- * setting's effective value (false, unless changed) is applied in
- * pmw3610_async_init_configure() -- i.e. enabling `force-awake` in DT alone
- * is overridden to `false` once CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS is
- * enabled. This is called out in README.md. */
+#define PMW3610_INST_ID_VAR(n) pmw3610_settings_id_##n
+#define PMW3610_INST_KEY_VAR(n, field) pmw3610_settings_key_##n##_##field
 
-static int read_int32(const char *key, int32_t fallback) {
+#define PMW3610_DECLARE_INST_STORAGE(n)                                                            \
+    static char PMW3610_INST_ID_VAR(n)[PMW3610_SETTINGS_ID_BUF_SIZE];                              \
+    static char PMW3610_INST_KEY_VAR(n, cpi)[PMW3610_SETTINGS_KEY_BUF_SIZE];                       \
+    static char PMW3610_INST_KEY_VAR(n, swap_xy)[PMW3610_SETTINGS_KEY_BUF_SIZE];                   \
+    static char PMW3610_INST_KEY_VAR(n, invert_x)[PMW3610_SETTINGS_KEY_BUF_SIZE];                  \
+    static char PMW3610_INST_KEY_VAR(n, invert_y)[PMW3610_SETTINGS_KEY_BUF_SIZE];                  \
+    static char PMW3610_INST_KEY_VAR(n, force_awake)[PMW3610_SETTINGS_KEY_BUF_SIZE];               \
+    static char PMW3610_INST_KEY_VAR(n, smart_algorithm)[PMW3610_SETTINGS_KEY_BUF_SIZE];           \
+    static char PMW3610_INST_KEY_VAR(n, run_downshift_ms)[PMW3610_SETTINGS_KEY_BUF_SIZE];          \
+    static char PMW3610_INST_KEY_VAR(n, rest1_downshift_ms)[PMW3610_SETTINGS_KEY_BUF_SIZE];        \
+    static char PMW3610_INST_KEY_VAR(n, rest2_downshift_ms)[PMW3610_SETTINGS_KEY_BUF_SIZE];        \
+    static char PMW3610_INST_KEY_VAR(n, rest1_sample_ms)[PMW3610_SETTINGS_KEY_BUF_SIZE];           \
+    static char PMW3610_INST_KEY_VAR(n, rest2_sample_ms)[PMW3610_SETTINGS_KEY_BUF_SIZE];           \
+    static char PMW3610_INST_KEY_VAR(n, rest3_sample_ms)[PMW3610_SETTINGS_KEY_BUF_SIZE];           \
+    static char PMW3610_INST_KEY_VAR(n, report_interval_min_ms)[PMW3610_SETTINGS_KEY_BUF_SIZE];
+
+DT_INST_FOREACH_STATUS_OKAY(PMW3610_DECLARE_INST_STORAGE)
+
+/* DT default cpi is 600 (dts/bindings/cormoran,pmw3610.yml); force_awake now
+ * defaults to this instance's own DT `force-awake` property (previously a
+ * single compile-time `false` shared by every device, since a single global
+ * setting couldn't represent a per-device DT property -- per-instance
+ * settings remove that limitation). */
+#define PMW3610_DEFINE_INST_SETTINGS(n)                                                            \
+    PMW3610_SETTING_INT32(pmw3610_setting_##n##_cpi, PMW3610_INST_KEY_VAR(n, cpi),                 \
+                          DT_INST_PROP_OR(n, cpi, 600), pmw3610_cpi_constraint);                   \
+    PMW3610_SETTING_BOOL(pmw3610_setting_##n##_swap_xy, PMW3610_INST_KEY_VAR(n, swap_xy),          \
+                         IS_ENABLED(CONFIG_PMW3610_SWAP_XY));                                      \
+    PMW3610_SETTING_BOOL(pmw3610_setting_##n##_invert_x, PMW3610_INST_KEY_VAR(n, invert_x),        \
+                         IS_ENABLED(CONFIG_PMW3610_INVERT_X));                                     \
+    PMW3610_SETTING_BOOL(pmw3610_setting_##n##_invert_y, PMW3610_INST_KEY_VAR(n, invert_y),        \
+                         IS_ENABLED(CONFIG_PMW3610_INVERT_Y));                                     \
+    PMW3610_SETTING_BOOL(pmw3610_setting_##n##_force_awake, PMW3610_INST_KEY_VAR(n, force_awake),  \
+                         DT_INST_PROP(n, force_awake));                                            \
+    PMW3610_SETTING_BOOL(pmw3610_setting_##n##_smart_algorithm,                                    \
+                         PMW3610_INST_KEY_VAR(n, smart_algorithm),                                 \
+                         IS_ENABLED(CONFIG_PMW3610_SMART_ALGORITHM));                              \
+    PMW3610_SETTING_INT32(pmw3610_setting_##n##_run_downshift_ms,                                  \
+                          PMW3610_INST_KEY_VAR(n, run_downshift_ms),                               \
+                          CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS, pmw3610_run_downshift_constraint); \
+    PMW3610_SETTING_INT32(                                                                         \
+        pmw3610_setting_##n##_rest1_downshift_ms, PMW3610_INST_KEY_VAR(n, rest1_downshift_ms),     \
+        CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS, pmw3610_rest1_downshift_constraint);               \
+    PMW3610_SETTING_INT32(                                                                         \
+        pmw3610_setting_##n##_rest2_downshift_ms, PMW3610_INST_KEY_VAR(n, rest2_downshift_ms),     \
+        CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS, pmw3610_rest2_downshift_constraint);               \
+    PMW3610_SETTING_INT32(pmw3610_setting_##n##_rest1_sample_ms,                                   \
+                          PMW3610_INST_KEY_VAR(n, rest1_sample_ms),                                \
+                          PMW3610_DEFAULT_REST1_SAMPLE_MS, pmw3610_sample_ms_constraint);          \
+    PMW3610_SETTING_INT32(pmw3610_setting_##n##_rest2_sample_ms,                                   \
+                          PMW3610_INST_KEY_VAR(n, rest2_sample_ms),                                \
+                          PMW3610_DEFAULT_REST2_SAMPLE_MS, pmw3610_sample_ms_constraint);          \
+    PMW3610_SETTING_INT32(pmw3610_setting_##n##_rest3_sample_ms,                                   \
+                          PMW3610_INST_KEY_VAR(n, rest3_sample_ms),                                \
+                          CONFIG_PMW3610_REST3_SAMPLE_TIME_MS, pmw3610_sample_ms_constraint);      \
+    PMW3610_SETTING_INT32(pmw3610_setting_##n##_report_interval_min_ms,                            \
+                          PMW3610_INST_KEY_VAR(n, report_interval_min_ms),                         \
+                          CONFIG_PMW3610_REPORT_INTERVAL_MIN, pmw3610_report_interval_constraint);
+
+DT_INST_FOREACH_STATUS_OKAY(PMW3610_DEFINE_INST_SETTINGS)
+
+/* Resolves this instance's settings id (DT `settings-id` property, or a
+ * hash of the devicetree node path) and fills its 13 key buffers, all
+ * before custom_settings_init() (APPLICATION init level, which resets
+ * every registered zmk_custom_setting's value from .default_value) and
+ * main()'s settings_load() (which reads persisted values by key) run --
+ * guaranteed by running at POST_KERNEL, an earlier init level than
+ * APPLICATION, regardless of relative priority within POST_KERNEL. Purely a
+ * function of compile-time-known devicetree data, so this has no ordering
+ * dependency on anything else in this init level. */
+#define PMW3610_INIT_INST_KEYS_FN(n)                                                               \
+    static int pmw3610_settings_keys_init_##n(void) {                                              \
+        pmw3610_settings_id_resolve(DT_INST_PROP_OR(n, settings_id, NULL),                         \
+                                    DT_NODE_PATH(DT_DRV_INST(n)), PMW3610_INST_ID_VAR(n));         \
+        snprintf(PMW3610_INST_KEY_VAR(n, cpi), PMW3610_SETTINGS_KEY_BUF_SIZE, "cpi@%s",            \
+                 PMW3610_INST_ID_VAR(n));                                                          \
+        snprintf(PMW3610_INST_KEY_VAR(n, swap_xy), PMW3610_SETTINGS_KEY_BUF_SIZE, "swap_xy@%s",    \
+                 PMW3610_INST_ID_VAR(n));                                                          \
+        snprintf(PMW3610_INST_KEY_VAR(n, invert_x), PMW3610_SETTINGS_KEY_BUF_SIZE, "invert_x@%s",  \
+                 PMW3610_INST_ID_VAR(n));                                                          \
+        snprintf(PMW3610_INST_KEY_VAR(n, invert_y), PMW3610_SETTINGS_KEY_BUF_SIZE, "invert_y@%s",  \
+                 PMW3610_INST_ID_VAR(n));                                                          \
+        snprintf(PMW3610_INST_KEY_VAR(n, force_awake), PMW3610_SETTINGS_KEY_BUF_SIZE,              \
+                 "force_awake@%s", PMW3610_INST_ID_VAR(n));                                        \
+        snprintf(PMW3610_INST_KEY_VAR(n, smart_algorithm), PMW3610_SETTINGS_KEY_BUF_SIZE,          \
+                 "smart_algorithm@%s", PMW3610_INST_ID_VAR(n));                                    \
+        snprintf(PMW3610_INST_KEY_VAR(n, run_downshift_ms), PMW3610_SETTINGS_KEY_BUF_SIZE,         \
+                 "run_downshift_ms@%s", PMW3610_INST_ID_VAR(n));                                   \
+        snprintf(PMW3610_INST_KEY_VAR(n, rest1_downshift_ms), PMW3610_SETTINGS_KEY_BUF_SIZE,       \
+                 "rest1_downshift_ms@%s", PMW3610_INST_ID_VAR(n));                                 \
+        snprintf(PMW3610_INST_KEY_VAR(n, rest2_downshift_ms), PMW3610_SETTINGS_KEY_BUF_SIZE,       \
+                 "rest2_downshift_ms@%s", PMW3610_INST_ID_VAR(n));                                 \
+        snprintf(PMW3610_INST_KEY_VAR(n, rest1_sample_ms), PMW3610_SETTINGS_KEY_BUF_SIZE,          \
+                 "rest1_sample_ms@%s", PMW3610_INST_ID_VAR(n));                                    \
+        snprintf(PMW3610_INST_KEY_VAR(n, rest2_sample_ms), PMW3610_SETTINGS_KEY_BUF_SIZE,          \
+                 "rest2_sample_ms@%s", PMW3610_INST_ID_VAR(n));                                    \
+        snprintf(PMW3610_INST_KEY_VAR(n, rest3_sample_ms), PMW3610_SETTINGS_KEY_BUF_SIZE,          \
+                 "rest3_sample_ms@%s", PMW3610_INST_ID_VAR(n));                                    \
+        snprintf(PMW3610_INST_KEY_VAR(n, report_interval_min_ms), PMW3610_SETTINGS_KEY_BUF_SIZE,   \
+                 "report_interval_min_ms@%s", PMW3610_INST_ID_VAR(n));                             \
+        return 0;                                                                                  \
+    }                                                                                              \
+    SYS_INIT(pmw3610_settings_keys_init_##n, POST_KERNEL, 0);
+
+DT_INST_FOREACH_STATUS_OKAY(PMW3610_INIT_INST_KEYS_FN)
+
+/* --- Apply effective settings to a device, by its own settings id ------ */
+
+static int32_t read_int32_by_field(const char *id, const char *field, int32_t fallback) {
+    char key[PMW3610_SETTINGS_KEY_BUF_SIZE];
+    snprintf(key, sizeof(key), "%s@%s", field, id);
+
     struct zmk_custom_setting_value value;
     if (zmk_custom_setting_read_by_key(PMW3610_SETTINGS_SUBSYSTEM_ID, key, &value) != 0 ||
         value.type != ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32) {
@@ -237,7 +344,10 @@ static int read_int32(const char *key, int32_t fallback) {
     return value.int32_value;
 }
 
-static bool read_bool(const char *key, bool fallback) {
+static bool read_bool_by_field(const char *id, const char *field, bool fallback) {
+    char key[PMW3610_SETTINGS_KEY_BUF_SIZE];
+    snprintf(key, sizeof(key), "%s@%s", field, id);
+
     struct zmk_custom_setting_value value;
     if (zmk_custom_setting_read_by_key(PMW3610_SETTINGS_SUBSYSTEM_ID, key, &value) != 0 ||
         value.type != ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL) {
@@ -251,27 +361,38 @@ void pmw3610_settings_apply_to_device(const struct device *dev) {
         return;
     }
 
-    pmw3610_set_cpi_runtime(dev, (uint32_t)read_int32("cpi", 600));
-    pmw3610_set_axis_flags(dev, read_bool("swap_xy", false), read_bool("invert_x", false),
-                           read_bool("invert_y", false));
-    pmw3610_set_force_awake(dev, read_bool("force_awake", false));
-    pmw3610_set_smart_algorithm(dev, read_bool("smart_algorithm", true));
+    char id[PMW3610_SETTINGS_ID_BUF_SIZE];
+    if (pmw3610_get_device_id(dev, id, sizeof(id)) != 0) {
+        return;
+    }
+
+    pmw3610_set_cpi_runtime(dev, (uint32_t)read_int32_by_field(id, "cpi", 600));
+    pmw3610_set_axis_flags(dev, read_bool_by_field(id, "swap_xy", false),
+                           read_bool_by_field(id, "invert_x", false),
+                           read_bool_by_field(id, "invert_y", false));
+    pmw3610_set_force_awake(dev, read_bool_by_field(id, "force_awake", false));
+    pmw3610_set_smart_algorithm(dev, read_bool_by_field(id, "smart_algorithm", true));
     pmw3610_set_run_downshift_ms(
-        dev, (uint32_t)read_int32("run_downshift_ms", CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS));
+        dev, (uint32_t)read_int32_by_field(id, "run_downshift_ms",
+                                           CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS));
     /* Apply sample times before downshift times: downshift range validation
      * in the driver depends on the *current* runtime sample time. */
     pmw3610_set_rest1_sample_ms(
-        dev, (uint32_t)read_int32("rest1_sample_ms", PMW3610_DEFAULT_REST1_SAMPLE_MS));
+        dev, (uint32_t)read_int32_by_field(id, "rest1_sample_ms", PMW3610_DEFAULT_REST1_SAMPLE_MS));
     pmw3610_set_rest2_sample_ms(
-        dev, (uint32_t)read_int32("rest2_sample_ms", PMW3610_DEFAULT_REST2_SAMPLE_MS));
+        dev, (uint32_t)read_int32_by_field(id, "rest2_sample_ms", PMW3610_DEFAULT_REST2_SAMPLE_MS));
     pmw3610_set_rest3_sample_ms(
-        dev, (uint32_t)read_int32("rest3_sample_ms", CONFIG_PMW3610_REST3_SAMPLE_TIME_MS));
+        dev,
+        (uint32_t)read_int32_by_field(id, "rest3_sample_ms", CONFIG_PMW3610_REST3_SAMPLE_TIME_MS));
     pmw3610_set_rest1_downshift_ms(
-        dev, (uint32_t)read_int32("rest1_downshift_ms", CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS));
+        dev, (uint32_t)read_int32_by_field(id, "rest1_downshift_ms",
+                                           CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS));
     pmw3610_set_rest2_downshift_ms(
-        dev, (uint32_t)read_int32("rest2_downshift_ms", CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS));
+        dev, (uint32_t)read_int32_by_field(id, "rest2_downshift_ms",
+                                           CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS));
     pmw3610_set_report_interval_min(
-        dev, (uint32_t)read_int32("report_interval_min_ms", CONFIG_PMW3610_REPORT_INTERVAL_MIN));
+        dev, (uint32_t)read_int32_by_field(id, "report_interval_min_ms",
+                                           CONFIG_PMW3610_REPORT_INTERVAL_MIN));
 }
 
 static void pmw3610_settings_apply_to_all_devices(void) {
@@ -295,8 +416,10 @@ static int pmw3610_settings_changed_listener(const zmk_event_t *eh) {
     /* All changed kinds (VALUE_UPDATED / SAVED / DISCARDED / RESET) mean
      * the same thing to us: re-read the effective value and push it to
      * every device. Re-applying every key on any single key's change is
-     * wasteful but simple and correct, and settings changes are rare
-     * (interactive Studio RPC use, not a hot path). */
+     * wasteful but simple and correct -- each device only ever reads keys
+     * scoped to its own settings id, so re-invoking this for an unrelated
+     * device is a no-op, not a correctness risk -- and settings changes
+     * are rare (interactive Studio RPC use, not a hot path). */
     pmw3610_settings_apply_to_all_devices();
     return 0;
 }

@@ -29,6 +29,13 @@ int pmw3610_get_init_error(const struct device *dev) {
     return -ENODEV;
 }
 
+int pmw3610_get_device_id(const struct device *dev, char *buf, size_t buf_len) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(buf);
+    ARG_UNUSED(buf_len);
+    return -ENODEV;
+}
+
 int pmw3610_read_register(const struct device *dev, uint8_t addr, uint8_t *value) {
     ARG_UNUSED(dev);
     ARG_UNUSED(addr);

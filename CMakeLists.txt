@@ -1,5 +1,13 @@
 zephyr_include_directories(include)
 
+if(CONFIG_PMW3610 OR CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS)
+    # Per-device settings id resolution (src/pmw3610_settings_id.c) is used
+    # by both the driver (GetInfo) and the settings module (per-device
+    # setting keys); tiny and side-effect-free, so it is cheap to always
+    # include whenever either consumer is built.
+    target_sources(app PRIVATE src/pmw3610_settings_id.c)
+endif()
+
 if(CONFIG_PMW3610)
     target_sources(app PRIVATE src/pmw3610.c)
 endif()

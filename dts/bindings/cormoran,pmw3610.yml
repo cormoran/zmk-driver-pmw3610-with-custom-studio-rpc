@@ -26,3 +26,16 @@ properties:
     type: boolean
   disable-burst-read:
     type: boolean
+  settings-id:
+    type: string
+    description: |
+      Stable short id (recommended: up to 8 ASCII characters) used to build
+      this device's per-device custom setting keys ("<param>@<id>") and
+      reported in the GetInfo Studio RPC response, so a firmware image with
+      multiple PMW3610 devices (or the same devicetree used across a split
+      keyboard's halves) gets independently persisted settings and a stable
+      web UI identity per sensor. Recommended when there is more than one
+      PMW3610 device in one firmware image (e.g. "trackball", "thumb") --
+      when omitted, a 4-hex-digit hash of this node's devicetree path is used
+      instead, which is stable across reordering of sibling devicetree nodes
+      but is not human-readable.

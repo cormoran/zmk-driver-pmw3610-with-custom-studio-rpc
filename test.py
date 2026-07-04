@@ -32,6 +32,8 @@ class ConfigAndDeviceTree:
     config: list[str | NotFound]
     # Expected rows in devicetree_generated.h
     device: list[str | NotFound]
+    # Expected (and NotFound) symbol names in zephyr/zmk.elf, checked via `nm`
+    elf_symbols: list[str | NotFound] | None = None
 
 
 class WestCommandsTests(unittest.TestCase):
@@ -128,6 +130,35 @@ class WestCommandsTests(unittest.TestCase):
                         "DT_COMPAT_HAS_OKAY_cormoran_pmw3610",
                     ],
                 ),
+                # Two PMW3610 devices in one firmware image (DESIGN.md Phase
+                # F): asserts each devicetree instance gets its own
+                # `zmk_custom_setting` entries (no symbol collisions), by
+                # name-mangled symbol in the linked ELF -- `nm` output looks
+                # like "200018e0 D pmw3610_setting_0_cpi".
+                "pmw3610_settings_rpc_dual": ConfigAndDeviceTree(
+                    config=[
+                        "CONFIG_PMW3610=y",
+                        "CONFIG_ZMK_STUDIO=y",
+                        "CONFIG_ZMK_PMW3610_STUDIO_RPC=y",
+                        "CONFIG_ZMK_CUSTOM_SETTINGS=y",
+                        "CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y",
+                    ],
+                    device=[
+                        "DT_COMPAT_HAS_OKAY_cormoran_pmw3610",
+                    ],
+                    elf_symbols=[
+                        "pmw3610_setting_0_cpi",
+                        "pmw3610_setting_1_cpi",
+                        "pmw3610_setting_0_force_awake",
+                        "pmw3610_setting_1_force_awake",
+                        "pmw3610_settings_id_0",
+                        "pmw3610_settings_id_1",
+                        # A hypothetical third instance's entries must not
+                        # accidentally exist (catches an off-by-one in the
+                        # DT_INST_FOREACH_STATUS_OKAY expansion).
+                        NotFound("pmw3610_setting_2_cpi"),
+                    ],
+                ),
             }
         )
 
@@ -162,6 +193,34 @@ class WestCommandsTests(unittest.TestCase):
                 (artifact_dir / "zmk.uf2").exists(),
                 f"{artifact} zmk.uf2 is missing in {artifact_dir}",
             )
+            if entries.elf_symbols:
+                self._test_elf_symbols(
+                    artifact_dir / "zmk.elf",
+                    entries.elf_symbols,
+                    f"{artifact} elf symbols",
+                )
+
+    def _test_elf_symbols(
+        self, elf_path: Path, expected_symbols: list[str | NotFound], hint: str
+    ):
+        self.assertTrue(elf_path.exists(), f"{hint}: {elf_path} is missing")
+        # `nm` (not the arm-specific variant) is enough to list symbol names
+        # from an ELF's symbol table regardless of target architecture.
+        result = subprocess.run(["nm", str(elf_path)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        symbol_names = {
+            line.split()[-1] for line in result.stdout.splitlines() if line.strip()
+        }
+
+        for expected in expected_symbols:
+            if isinstance(expected, NotFound):
+                if expected.text in symbol_names:
+                    self.fail(
+                        f"{hint}: symbol {expected.text} found, but it should not be present"
+                    )
+            else:
+                if expected not in symbol_names:
+                    self.fail(f"{hint}: symbol {expected} not found in {elf_path}")
 
     def _test_strings_in_file(
         self, file_path: Path, expected_strings: list[str | NotFound], hint: str

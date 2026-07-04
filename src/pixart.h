@@ -12,6 +12,8 @@
 #include <zephyr/drivers/sensor.h>
 #include <zephyr/kernel.h>
 
+#include <cormoran/pmw3610/pmw3610_settings_id.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -80,6 +82,11 @@ struct pixart_data {
      * capture starts, so this is a belt-and-braces check in addition to
      * disabling the motion IRQ. */
     bool capture_active;
+
+    /* Resolved once in pmw3610_init() from config->settings_id/dt_node_path
+     * (see pmw3610_settings_id_resolve()) -- stable per-device id used to
+     * build this device's custom setting keys and reported in GetInfo. */
+    char device_id[PMW3610_SETTINGS_ID_BUF_SIZE];
 };
 
 // device config data structure
@@ -92,6 +99,11 @@ struct pixart_config {
     uint8_t y_input_code;
     bool force_awake;
     bool disable_burst_read;
+    /* NULL if the devicetree node has no `settings-id` property. */
+    const char *settings_id;
+    /* This node's devicetree full path (DT_NODE_PATH()), used to derive
+     * device_id when settings_id is NULL. Always non-NULL. */
+    const char *dt_node_path;
 };
 
 #ifdef __cplusplus

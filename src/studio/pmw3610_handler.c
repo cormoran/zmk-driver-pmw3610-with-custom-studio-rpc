@@ -101,6 +101,10 @@ static void handle_get_info_request(const cormoran_pmw3610_GetInfoRequest *req,
         cormoran_pmw3610_DeviceInfo *info = &result.devices[result.devices_count];
         info->ready = pmw3610_is_ready(dev);
         info->init_error = pmw3610_get_init_error(dev);
+        info->device_index = (uint32_t)i;
+        if (pmw3610_get_device_id(dev, info->settings_id, sizeof(info->settings_id)) != 0) {
+            info->settings_id[0] = '\0';
+        }
 
         uint8_t product_id = 0;
         if (pmw3610_read_register(dev, 0x00, &product_id) == 0) {

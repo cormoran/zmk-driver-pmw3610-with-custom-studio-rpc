@@ -37,3 +37,21 @@ include:
     snippets:
       - studio-rpc-usb-uart
       - pmw3610-trackball
+
+  # Two PMW3610 devices in one firmware image (DESIGN.md Phase F): proves
+  # per-device settings entries ("<param>@<id>") compile without symbol
+  # collisions for more than one devicetree instance, covering both the
+  # explicit `settings-id` property and the devicetree-path-hash fallback.
+  # See test.py for the ELF symbol assertions.
+  - artifact: pmw3610_settings_rpc_dual
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    cmake-args: >-
+      -DCONFIG_ZMK_STUDIO=y
+      -DCONFIG_ZMK_PMW3610_STUDIO_RPC=y
+      -DCONFIG_ZMK_CUSTOM_SETTINGS=y
+      -DCONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC=y
+      -DCONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y
+    snippets:
+      - studio-rpc-usb-uart
+      - pmw3610-trackball-dual

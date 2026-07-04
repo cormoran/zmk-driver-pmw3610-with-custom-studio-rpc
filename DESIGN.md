@@ -538,7 +538,7 @@ the streaming mechanism end-to-end, use a validation-only build with
 to `build.yaml`) — mirrors the earlier `boot0` scratch-overlay approach for
 the same reason (environment can't do physical/human steps).
 
-## Phase F (design only, not yet implemented): multiple sensors + split peripheral support
+## Phase F: multiple sensors + split peripheral support
 
 Goal: (1) first-class support for **multiple PMW3610 devices per firmware
 image** (per-device settings instead of today's single global set), and
@@ -547,8 +547,48 @@ become visible/controllable through the central's Studio RPC (info,
 diagnostics, registers, frame capture/streaming) and through
 zmk-feature-custom-settings.
 
-Everything below is design; implementation is future work. Facts about the
-dependencies were verified against the checked-out sources (paths cited).
+Everything below was design; implementation status per stage (F.6):
+
+- **F-a (multi-device settings, local only) — implemented.** Per-device
+  `"<param>@<id>"` custom-settings keys
+  (`include/cormoran/pmw3610/pmw3610_settings_id.h`,
+  `src/pmw3610_settings_id.c`, `src/settings/pmw3610_settings.c`), a new DT
+  `settings-id` property (`dts/bindings/cormoran,pmw3610.yml`) with a
+  4-hex-digit devicetree-path-hash fallback, `pmw3610_get_device_id()`
+  (`include/cormoran/pmw3610/pmw3610_api.h`), and `GetInfo`
+  `device_index`/`settings_id` fields (`proto/cormoran/pmw3610/pmw3610.proto`,
+  `src/studio/pmw3610_handler.c`). `force_awake`/`cpi` defaults are now
+  per-instance DT properties instead of one compile-time-shared value,
+  resolving the Phase B `force_awake` caveat. Verified: `west zmk-build`
+  (`pmw3610_settings_rpc_dual` build artifact, `tests/zmk-config/snippets/
+  pmw3610-trackball-dual/`, two real devicetree instances on one SPI bus,
+  one with an explicit `settings-id` and one relying on the hash fallback)
+  plus an ELF-symbol assertion in `test.py` proving two independent
+  `zmk_custom_setting` entry sets get generated with no symbol collisions;
+  `west zmk-test` (native_sim, zero devices) and web unit
+  tests/lint/build all still pass. Not yet hardware-validated (this
+  environment has no PMW3610 sensor attached — see "Hardware validation
+  status" below); README updated.
+- **F-b through F-e (relay bridge, peripheral executor, frame streaming,
+  web split UI) — not yet implemented.** No split-capable hardware (two
+  physical halves) is available in this environment to validate a relay
+  round-trip end-to-end, so this work is left as design (below) for a
+  session with that hardware, rather than shipping unverified relay/nanopb
+  wiring. F-b's proto/Kconfig scaffolding and the handler-to-executor
+  refactor do not themselves need split hardware and would be reasonable
+  to pick up first.
+
+### Hardware validation status (2026-07)
+
+No PMW3610 sensor or split-capable board pair was attached in this
+environment. F-a was validated at the build/native_sim/web-test level
+only (see above) — not against a real sensor's persisted `cpi@<id>` value
+across reboot, nor a real two-half split link. Re-run the "Validation plan
+(hardware)" steps below (extended with a second device / settings-id) once
+hardware is available.
+
+Facts about the dependencies below were verified against the checked-out
+sources (paths cited).
 
 ### F.0 Facts this design builds on (verified in dependencies/)
 

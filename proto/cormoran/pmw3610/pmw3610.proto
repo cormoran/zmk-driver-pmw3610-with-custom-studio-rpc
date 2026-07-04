@@ -26,6 +26,16 @@ message DeviceInfo {
     uint32 revision_id = 3;
     int32 init_error = 4;
     RuntimeConfig runtime_config = 5;
+    // Index of this device within its source (see GetInfoRequest.source),
+    // usable as ReadDiagnostics/ReadRegister/WriteRegister/CaptureFrame's
+    // device_index against the same source.
+    uint32 device_index = 6;
+    // Stable per-device id (devicetree `settings-id` property, or a 4-hex
+    // hash of the devicetree node path if absent) -- see
+    // pmw3610_settings_id.h. Used to build this device's per-device custom
+    // setting keys ("<param>@<id>") in the cormoran__pmw3610 custom-settings
+    // subsystem, and lets the web UI group settings by device.
+    string settings_id = 7;
 }
 
 message GetInfoResponse { repeated DeviceInfo devices = 1; }

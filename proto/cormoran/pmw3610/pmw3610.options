@@ -2,6 +2,9 @@
 # This defines max sizes for string fields and max counts for repeated fields
 
 cormoran.pmw3610.ErrorResponse.message        max_size:64
-cormoran.pmw3610.GetInfoResponse.devices      max_count:2
+# Raised from 2 to 4 to support multiple PMW3610 devices in one firmware
+# image (see DESIGN.md Phase F).
+cormoran.pmw3610.GetInfoResponse.devices      max_count:4
+cormoran.pmw3610.DeviceInfo.settings_id       max_size:16
 cormoran.pmw3610.GetFrameChunkResponse.data    max_size:128
 cormoran.pmw3610.FrameStreamChunk.data         max_size:128
