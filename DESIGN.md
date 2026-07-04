@@ -397,13 +397,26 @@ Implemented in Phase C as four cards plus the connection card:
 - Overlay (from zmk-keyboard-dya2 right-trackball, user's wiring):
   - spi0 pinctrl: SCK = P0.05 (D5), MOSI = MISO = P1.13 (D8, 3-wire shared)
   - CS = `&xiao_d 10`, IRQ = `&xiao_d 9` (active low, pull-up)
-  - `cormoran,pmw3610`, `spi-max-frequency = <2000000>`, `disable-burst-read`
+  - `cormoran,pmw3610`, `spi-max-frequency = <2000000>`
   - **Important**: tester_xiao's kscan uses `xiao_d 0..10`; the overlay must
     `/delete-property/ input-gpios` and redefine with D0–D4 only to avoid
     conflicts with D5/D8/D9/D10.
   - `zmk,input-listener` node for the sensor. `CONFIG_ZMK_POINTING=y`.
+- **Burst read ON vs OFF**: two snippets, `tests/zmk-config/snippets/
+  pmw3610-trackball` (burst read ON -- no `disable-burst-read` property,
+  the normal/recommended mode) and `.../pmw3610-trackball-no-burst`
+  (`disable-burst-read` set). Burst read needs NCS (`cs-gpios`) held low
+  across the whole multi-byte transfer; since this overlay's `&spi0` always
+  configures `cs-gpios`, ON is fully usable and is what real deployments
+  should use. OFF only matters for wiring/boards where the SPI bus has no
+  controller-driven NCS at all -- provided here purely for build/motion
+  coverage of that code path (`pmw3610_report_data()`'s
+  `config->disable_burst_read` branch), via a dedicated
+  `pmw3610_plain_no_burst` build.yaml artifact (motion reporting is the only
+  thing burst mode affects; RPC/settings artifacts stay on the ON snippet).
 - build.yaml artifacts: `pmw3610_disabled` (module off), `pmw3610_plain`
-  (driver only), `pmw3610_rpc` (driver + custom RPC, no custom settings),
+  (driver only, burst read ON), `pmw3610_plain_no_burst` (driver only, burst
+  read OFF), `pmw3610_rpc` (driver + custom RPC, no custom settings),
   `pmw3610_settings_rpc` (driver + custom RPC + custom settings + custom
   settings' own Studio RPC: `-DCONFIG_ZMK_STUDIO=y
   -DCONFIG_ZMK_PMW3610_STUDIO_RPC=y -DCONFIG_ZMK_CUSTOM_SETTINGS=y

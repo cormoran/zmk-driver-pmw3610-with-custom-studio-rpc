@@ -8,6 +8,15 @@ include:
     shield: tester_xiao
     snippet: pmw3610-trackball
 
+  # Burst read OFF coverage (pmw3610_plain above is burst read ON, the
+  # normal/recommended mode -- see the snippets' overlay comments). Only
+  # the plain motion-reporting artifact is duplicated since burst read only
+  # affects pmw3610_report_data()'s SPI transfer shape, not RPC/settings.
+  - artifact: pmw3610_plain_no_burst
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    snippet: pmw3610-trackball-no-burst
+
   - artifact: pmw3610_rpc
     board: xiao_ble//zmk
     shield: tester_xiao

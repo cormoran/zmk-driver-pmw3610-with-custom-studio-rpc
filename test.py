@@ -84,6 +84,20 @@ class WestCommandsTests(unittest.TestCase):
                         "DT_COMPAT_HAS_OKAY_cormoran_pmw3610",
                     ],
                 ),
+                # Burst read OFF variant: same driver config as pmw3610_plain
+                # (burst read is a devicetree property, not a Kconfig), just
+                # built from the pmw3610-trackball-no-burst snippet.
+                "pmw3610_plain_no_burst": ConfigAndDeviceTree(
+                    config=[
+                        "CONFIG_PMW3610=y",
+                        "CONFIG_INPUT=y",
+                        "CONFIG_ZMK_POINTING=y",
+                        "# CONFIG_ZMK_STUDIO is not set",
+                    ],
+                    device=[
+                        "DT_COMPAT_HAS_OKAY_cormoran_pmw3610",
+                    ],
+                ),
                 "pmw3610_rpc": ConfigAndDeviceTree(
                     config=[
                         "CONFIG_PMW3610=y",

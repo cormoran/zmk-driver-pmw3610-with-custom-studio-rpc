@@ -119,6 +119,14 @@ For more info on modules, you can read through through the [Zephyr modules page]
    `tests/zmk-config/snippets/pmw3610-trackball/pmw3610-trackball.overlay` for
    a full example) and enable the driver in your `config/<shield>.conf`:
 
+   Leave `disable-burst-read` unset (the default) unless your SPI bus has no
+   NCS/`cs-gpios` under the controller's control -- burst read needs chip
+   select held low across the whole multi-byte motion-burst transfer, so it
+   only needs disabling on wiring that can't do that. This module's own test
+   config builds and validates both: `pmw3610-trackball` (burst read ON,
+   recommended) and `pmw3610-trackball-no-burst` (OFF) under
+   `tests/zmk-config/snippets/`.
+
    ```conf
    CONFIG_PMW3610=y
    CONFIG_INPUT=y

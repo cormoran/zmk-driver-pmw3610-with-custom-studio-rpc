@@ -54,11 +54,13 @@
 	cs-gpios = <&xiao_d 10 GPIO_ACTIVE_LOW>;
 
 	/*
-	 * Burst read ON (the default -- omitting disable-burst-read): the
-	 * normal/recommended mode. It needs NCS (cs-gpios, set above on &spi0)
-	 * so the controller can hold chip-select across the whole burst
-	 * transfer; that's configured here, so there's no reason to disable
-	 * it. See ../pmw3610-trackball-no-burst for the disabled variant.
+	 * Burst read OFF: covers boards/wiring where the SPI bus has no NCS
+	 * (cs-gpios) under the controller's control -- burst read needs NCS
+	 * held low across the whole multi-byte transfer, so without it each
+	 * register must be read individually instead. This test config does
+	 * configure cs-gpios (see &spi0 above), so ON (../pmw3610-trackball)
+	 * is the normal/recommended mode; this variant exists purely for
+	 * build/motion-reporting coverage of the disabled path.
 	 */
 	trackball: trackball@0 {
 		status = "okay";
@@ -69,6 +71,7 @@
 		evt-type = <INPUT_EV_REL>;
 		x-input-code = <INPUT_REL_X>;
 		y-input-code = <INPUT_REL_Y>;
+		disable-burst-read;
 	};
 };
 
