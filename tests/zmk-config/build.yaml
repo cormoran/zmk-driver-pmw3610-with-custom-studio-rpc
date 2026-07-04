@@ -55,3 +55,24 @@ include:
     snippets:
       - studio-rpc-usb-uart
       - pmw3610-trackball-dual
+
+  # Split keyboard build coverage (DESIGN.md Phase F): peripheral role (with
+  # a real sensor) and central role (with the local RPC + relay bridge)
+  # built as separate firmware images, proving both roles compile --
+  # end-to-end relay behavior is covered by the native_sim
+  # tests/split_peripheral test (no real split hardware in this
+  # environment; see DESIGN.md).
+  - artifact: pmw3610_split_peripheral
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    snippets:
+      - pmw3610-trackball
+      - pmw3610-split-rpc-relay
+
+  - artifact: pmw3610_split_central
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    snippets:
+      - studio-rpc-usb-uart
+      - pmw3610-split-rpc-relay
+      - pmw3610-split-central

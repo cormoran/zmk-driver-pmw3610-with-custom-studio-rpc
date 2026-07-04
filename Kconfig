@@ -103,6 +103,7 @@ endif #PMW3610
 config ZMK_PMW3610_STUDIO_RPC
     bool "Enable PMW3610 custom Studio RPC"
     depends on ZMK_STUDIO
+    select ZMK_PMW3610_PROTOBUF
     help
       Custom (unofficial) ZMK Studio RPC subsystem exposing PMW3610 sensor
       info and diagnostics. Works with zero PMW3610 devices present (e.g.
@@ -120,6 +121,58 @@ config ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE
       request's pixel_count is clamped to this size.
 
 endif # ZMK_PMW3610_STUDIO_RPC
+
+config ZMK_PMW3610_SPLIT_RPC_RELAY
+    bool "Relay PMW3610 Studio RPC to split peripherals"
+    depends on ZMK_SPLIT_RELAY_EVENT
+    select ZMK_PMW3610_PROTOBUF
+    help
+      Enable on BOTH halves of a split keyboard to reach PMW3610 devices
+      living on a split peripheral through the central's cormoran__pmw3610
+      Studio RPC subsystem: GetInfo/ReadDiagnostics/ReadRegister/
+      WriteRegister requests with a nonzero `source` are relayed to the
+      matching peripheral over CONFIG_ZMK_SPLIT_RELAY_EVENT, and the
+      response arrives back as a PeripheralResponse Studio notification
+      (relaying is asynchronous, unlike a local request). CaptureFrame/
+      GetFrameChunk/SetFrameStream do not support relaying yet. Increase
+      CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN if your build fails a
+      BUILD_ASSERT about the relayed request/response payload size (a
+      GetInfoResponse for multiple peripheral devices needs more room than
+      the framework's default).
+      Note: the underlying split relay event transport broadcasts to every
+      connected peripheral, not to one addressed peripheral -- with more
+      than one peripheral, every peripheral answers every relayed request
+      (each correctly tagged with its own source), which does not compose
+      well with a UI that only expects an answer from a specific one. Safe
+      to enable for a build with a single peripheral.
+
+config ZMK_PMW3610_SPLIT_RPC_RELAY_TEST
+    bool "Enable native_sim-only PMW3610 split relay test hooks"
+    depends on ZMK_PMW3610_SPLIT_RPC_RELAY
+    depends on !ZMK_SPLIT_ROLE_CENTRAL
+    help
+      Adds a boot-time self-test (peripheral role only) that synthesizes a
+      relayed request locally (bypassing the real transport, which
+      native_sim cannot exercise end-to-end) and asserts the resulting
+      relay response, printing PASS/FAIL to the log -- see
+      tests/split_peripheral. Not for production builds.
+
+# Internal: whether nanopb should generate code for pmw3610*.proto. Split out
+# from ZMK_PMW3610_STUDIO_RPC (which additionally implies CONFIG_ZMK_STUDIO,
+# unavailable on a split peripheral) so a split peripheral -- which has no
+# Studio of its own -- can still encode/decode these messages for relaying.
+# `select NANOPB` (+ the same `imply`s ZMK_STUDIO_RPC itself uses) directly,
+# rather than relying on CONFIG_ZMK_STUDIO_RPC to have pulled NANOPB in --
+# on a split peripheral, ZMK_STUDIO_RPC is never selected (ZMK_STUDIO only
+# `select`s it `if !ZMK_SPLIT || ZMK_SPLIT_ROLE_CENTRAL`), so without this
+# the nanopb runtime headers (pb.h) are unavailable even though nanopb code
+# generation itself (nanopb_generate_cpp in CMakeLists.txt) still runs.
+config ZMK_PMW3610_PROTOBUF
+    bool
+    select NANOPB
+    imply NANOPB_NO_ERRMSG
+    imply NANOPB_WITHOUT_64BIT
+    imply NANOPB_NO_ENCODE_SIZE_CHECK
 
 config ZMK_PMW3610_CUSTOM_SETTINGS
     bool "Enable PMW3610 runtime settings via zmk-feature-custom-settings"

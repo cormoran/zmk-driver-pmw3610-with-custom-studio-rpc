@@ -2,7 +2,14 @@ syntax = "proto3";
 
 package cormoran.pmw3610;
 
-message GetInfoRequest {}
+// `source` addresses which firmware image's local devices a request targets:
+// 0 (the default, omitted) means this device (the Studio RPC central
+// itself); a nonzero value relays the request to a split peripheral (see
+// DESIGN.md Phase F) -- requires CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY on both
+// halves. Only GetInfo/ReadDiagnostics/ReadRegister/WriteRegister support
+// relaying so far; CaptureFrame/GetFrameChunk/SetFrameStream do not have a
+// `source` field yet and always target local devices.
+message GetInfoRequest { uint32 source = 1; }
 
 message RuntimeConfig {
     uint32 cpi = 1;
@@ -40,7 +47,11 @@ message DeviceInfo {
 
 message GetInfoResponse { repeated DeviceInfo devices = 1; }
 
-message ReadDiagnosticsRequest { uint32 device_index = 1; }
+message ReadDiagnosticsRequest {
+    uint32 device_index = 1;
+    // See GetInfoRequest.source.
+    uint32 source = 2;
+}
 
 message ReadDiagnosticsResponse {
     uint32 squal = 1;
@@ -53,6 +64,8 @@ message ReadDiagnosticsResponse {
 message ReadRegisterRequest {
     uint32 device_index = 1;
     uint32 address = 2;
+    // See GetInfoRequest.source.
+    uint32 source = 3;
 }
 
 message ReadRegisterResponse { uint32 value = 1; }
@@ -66,6 +79,8 @@ message WriteRegisterRequest {
     uint32 device_index = 1;
     uint32 address = 2;
     uint32 value = 3;
+    // See GetInfoRequest.source.
+    uint32 source = 4;
 }
 
 message WriteRegisterResponse {}
@@ -161,6 +176,12 @@ message Request {
 
 message ErrorResponse { string message = 1; }
 
+// Returned immediately in place of the real response when a request's
+// `source` targets a split peripheral (relaying is inherently
+// asynchronous -- see DESIGN.md Phase F): the real Response for
+// `request_id` arrives later as a `PeripheralResponse` Notification.
+message DeferredResponse { uint32 request_id = 1; }
+
 message Response {
     oneof response_type {
         ErrorResponse error = 1;
@@ -171,7 +192,36 @@ message Response {
         CaptureFrameResponse capture_frame = 6;
         GetFrameChunkResponse get_frame_chunk = 7;
         SetFrameStreamResponse set_frame_stream = 8;
+        DeferredResponse deferred = 9;
     }
+}
+
+// The real response to a request that returned a DeferredResponse, once the
+// targeted peripheral's answer has relayed back to the central. Raised as a
+// custom Studio notification (not a Request/Response), matching
+// FrameStreamChunk's pattern.
+message PeripheralResponse {
+    // Matches the source given in the original request (1 = first
+    // peripheral, etc; never 0 -- local requests are answered synchronously
+    // and never produce a DeferredResponse/PeripheralResponse).
+    uint32 source = 1;
+    uint32 request_id = 2;
+    Response response = 3;
+}
+
+// Wire format for relaying a Request to a split peripheral and its Response
+// back, carried as the opaque payload of this module's own
+// zmk_pmw3610_relay_request/zmk_pmw3610_relay_response ZMK split relay
+// events (see src/split/pmw3610_relay.c) -- NOT part of the Request/Response
+// oneofs above, and never sent directly over the Studio RPC transport.
+message RelayRequest {
+    uint32 request_id = 1;
+    Request request = 2;
+}
+
+message RelayResponse {
+    uint32 request_id = 1;
+    Response response = 2;
 }
 
 // One 128-byte-or-less chunk of a frame captured while streaming
@@ -196,5 +246,8 @@ message FrameStreamChunk {
 }
 
 message Notification {
-    oneof notification_type { FrameStreamChunk frame_stream_chunk = 1; }
+    oneof notification_type {
+        FrameStreamChunk frame_stream_chunk = 1;
+        PeripheralResponse peripheral_response = 2;
+    }
 }

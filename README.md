@@ -335,10 +335,57 @@ requires ZMK Studio to be unlocked — see "Security" above — but treat access
 to it like access to a debug/JTAG interface regardless: fine for your own
 trusted host, not something to expose over an untrusted transport.
 
+### Split keyboards / multiple sensors (`source`, `CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY`)
+
+**Multiple PMW3610 devices in one firmware image** (e.g. two sensors on the
+same half) already work with no extra configuration: each devicetree
+instance gets its own settings (see "Runtime settings" above) and its own
+entry in `GetInfo`'s `devices` list (`device_index`/`settings_id`).
+
+**Reaching a sensor on a split keyboard's *peripheral* half** additionally
+requires `CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY=y` on **both** halves (depends
+on ZMK's `CONFIG_ZMK_SPLIT_RELAY_EVENT`) plus, since a relayed
+`GetInfoResponse` needs more room than the framework's 128-byte default,
+`CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN=224`. Add a `source` field to
+`GetInfoRequest`/`ReadDiagnosticsRequest`/`ReadRegisterRequest`/
+`WriteRegisterRequest`: `0` (the default) targets local devices, `1` the
+first peripheral. Since relaying is inherently asynchronous, a relayed
+request's RPC call returns immediately with a `DeferredResponse
+{request_id}`; the real answer arrives later as a `PeripheralResponse
+{source, request_id, response}` Studio notification (subscribe to it like
+`FrameStreamChunk`).
+
+```jsonc
+// GetInfo targeting the first split peripheral's own devices
+{ "getInfo": { "source": 1 } }
+// -> { "deferred": { "requestId": 7 } }   // immediate
+// ... later, as a notification:
+// { "peripheralResponse": { "source": 1, "requestId": 7,
+//     "response": { "getInfo": { "devices": [ ... ] } } } }
+```
+
+`CaptureFrame`/`GetFrameChunk`/`SetFrameStream` do not support a `source`
+field yet — frame capture/streaming from a peripheral's sensor is not
+implemented (see [DESIGN.md](./DESIGN.md) Phase F). The underlying relay
+transport also broadcasts a request to *every* connected peripheral rather
+than addressing one specifically (each one's answer still arrives correctly
+tagged with its own `source`) — fine for the common single-peripheral
+split, but means a multi-peripheral build gets one `PeripheralResponse` per
+peripheral for the same `request_id`.
+
+This has been build-tested (both roles compile, see
+`tests/zmk-config/build.yaml`'s `pmw3610_split_*` artifacts) and the
+peripheral-side request execution has a native_sim self-test
+(`tests/split_peripheral`), but **not yet validated against real split
+hardware** — no split-capable board pair was available while developing
+this feature.
+
 ### Web UI
 
 See [web/README.md](./web/README.md) for web UI development instructions,
-including the settings panel, diagnostics polling, and frame viewer.
+including the settings panel, diagnostics polling, and frame viewer. The web
+UI does not yet have controls for the split `source` field above (Studio
+calls from the current UI always target `source: 0`, i.e. local devices).
 
 ### Publishing Web UI
 

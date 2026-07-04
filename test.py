@@ -56,6 +56,9 @@ class WestCommandsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("PASS: test", result.stdout, result.stdout + result.stderr)
         self.assertIn("PASS: studio", result.stdout, result.stdout + result.stderr)
+        self.assertIn(
+            "PASS: split_peripheral", result.stdout, result.stdout + result.stderr
+        )
         self.assertNotIn("FAILED: ", result.stdout, result.stdout + result.stderr)
 
     def test_zmk_build(self):
@@ -158,6 +161,37 @@ class WestCommandsTests(unittest.TestCase):
                         # DT_INST_FOREACH_STATUS_OKAY expansion).
                         NotFound("pmw3610_setting_2_cpi"),
                     ],
+                ),
+                # Split keyboard build coverage (DESIGN.md Phase F). Peripheral
+                # role: no Studio (ZMK_STUDIO only selects ZMK_STUDIO_RPC for
+                # !ZMK_SPLIT || ZMK_SPLIT_ROLE_CENTRAL), but the relay bridge +
+                # a real sensor still compile.
+                "pmw3610_split_peripheral": ConfigAndDeviceTree(
+                    config=[
+                        "CONFIG_PMW3610=y",
+                        "CONFIG_ZMK_SPLIT=y",
+                        NotFound("CONFIG_ZMK_SPLIT_ROLE_CENTRAL=y"),
+                        "CONFIG_ZMK_SPLIT_RELAY_EVENT=y",
+                        "CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY=y",
+                        NotFound("CONFIG_ZMK_STUDIO=y"),
+                    ],
+                    device=[
+                        "DT_COMPAT_HAS_OKAY_cormoran_pmw3610",
+                    ],
+                ),
+                # Central role: local Studio RPC + the relay bridge dispatch
+                # side, no local sensor required to reach split peripheral
+                # devices.
+                "pmw3610_split_central": ConfigAndDeviceTree(
+                    config=[
+                        "CONFIG_ZMK_SPLIT=y",
+                        "CONFIG_ZMK_SPLIT_ROLE_CENTRAL=y",
+                        "CONFIG_ZMK_SPLIT_RELAY_EVENT=y",
+                        "CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY=y",
+                        "CONFIG_ZMK_STUDIO=y",
+                        "CONFIG_ZMK_PMW3610_STUDIO_RPC=y",
+                    ],
+                    device=[],
                 ),
             }
         )

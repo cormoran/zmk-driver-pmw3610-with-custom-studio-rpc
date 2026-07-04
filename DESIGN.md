@@ -569,23 +569,69 @@ Everything below was design; implementation status per stage (F.6):
   tests/lint/build all still pass. Not yet hardware-validated (this
   environment has no PMW3610 sensor attached — see "Hardware validation
   status" below); README updated.
-- **F-b through F-e (relay bridge, peripheral executor, frame streaming,
-  web split UI) — not yet implemented.** No split-capable hardware (two
-  physical halves) is available in this environment to validate a relay
-  round-trip end-to-end, so this work is left as design (below) for a
-  session with that hardware, rather than shipping unverified relay/nanopb
-  wiring. F-b's proto/Kconfig scaffolding and the handler-to-executor
-  refactor do not themselves need split hardware and would be reasonable
-  to pick up first.
+- **F-b + F-c (relay proto/Kconfig scaffolding, handler-to-executor
+  refactor, peripheral executor, central bridge for non-frame RPCs) —
+  implemented.** `GetInfoRequest`/`ReadDiagnosticsRequest`/
+  `ReadRegisterRequest`/`WriteRegisterRequest` gained a `source` field
+  (0 = local, N = peripheral N); a nonzero source on the central is relayed
+  to split peripherals and answered asynchronously via a new
+  `DeferredResponse` (returned immediately) followed by a `PeripheralResponse`
+  Studio notification (`proto/cormoran/pmw3610/pmw3610.proto`). The
+  four supported request handlers were extracted from
+  `src/studio/pmw3610_handler.c` into a transport-independent executor
+  (`src/studio/pmw3610_request_exec.c`/`.h`), shared by the Studio RPC
+  handler (central, local requests) and the new split relay bridge
+  (`src/split/pmw3610_relay.c`/`include/cormoran/pmw3610/pmw3610_relay.h`,
+  `CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY`, both roles) — the relay events
+  (`zmk_pmw3610_relay_request`/`_response`, identifiers `pmq`/`pmp`) and
+  the Kconfig/nanopb decoupling (`CONFIG_ZMK_PMW3610_PROTOBUF`, needed
+  because a peripheral has no `ZMK_STUDIO_RPC` to `select NANOPB` for it)
+  follow exactly the F.0 design below. CaptureFrame/GetFrameChunk/
+  SetFrameStream do not relay yet (F-d).
+  **Real constraint found while implementing** (not anticipated in the
+  original F.2 design): ZMK's split relay event wire header
+  (`relay_event_header.event_data_size`) is a single `uint8_t`, hard-capping
+  any relayed message at 255 bytes regardless of
+  `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` — a relayed `GetInfoResponse` for
+  4 devices (this module's earlier max_count) encodes to ~440 bytes, far
+  over that ceiling. Fixed by lowering `GetInfoResponse.devices` max_count
+  from 4 to 2 (`pmw3610.options`; a 2-device `RelayResponse` is ~218 bytes,
+  and both relay structs' sizes are checked at compile time against both
+  `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` *and* the hard 255-byte ceiling —
+  see the `BUILD_ASSERT`s in `pmw3610_relay.c`) and shrinking
+  `DeviceInfo.settings_id`'s `max_size` from 16 to 9 (matching
+  `PMW3610_SETTINGS_ID_BUF_SIZE` exactly instead of over-allocating).
+  Verified: `tests/split_peripheral` (new native_sim test, peripheral role,
+  zero local devices — synthesizes an encoded `RelayRequest` locally via a
+  `CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST` self-test, since native_sim
+  cannot exercise the real BLE transport, and asserts the decoded
+  `RelayResponse` for both a supported kind (`GetInfo`) and an unsupported
+  one (`CaptureFrame`, correctly rejected) — this is the same self-test
+  pattern zmk-feature-custom-settings' own `tests/split_peripheral` uses
+  for the identical reason); two new `west zmk-build` artifacts
+  (`pmw3610_split_peripheral` with a real sensor, `pmw3610_split_central`)
+  proving both roles compile as real ARM firmware; `python3 -m unittest`
+  (build + native_sim + this new test) and web unit tests/lint/build all
+  still pass.
+- **F-d + F-e (frame capture/streaming over relay, web split UI) — not yet
+  implemented.** No split-capable hardware (two physical halves) is
+  available in this environment to validate a *real* relay round-trip
+  end-to-end (native_sim can only prove the peripheral-side executor logic
+  in isolation, as F-c's test does — it cannot exercise the actual BLE
+  transport), so streaming (higher risk: ongoing per-chunk state, lock/
+  disconnect stop paths) and the web UI's source-addressed device model are
+  left as design (below) for a session with that hardware.
 
 ### Hardware validation status (2026-07)
 
 No PMW3610 sensor or split-capable board pair was attached in this
-environment. F-a was validated at the build/native_sim/web-test level
-only (see above) — not against a real sensor's persisted `cpi@<id>` value
-across reboot, nor a real two-half split link. Re-run the "Validation plan
-(hardware)" steps below (extended with a second device / settings-id) once
-hardware is available.
+environment. F-a/F-b/F-c were validated at the build/native_sim/web-test
+level only (see above) — not against a real sensor's persisted `cpi@<id>`
+value across reboot, nor a real two-half split link exercising the actual
+BLE relay transport (only the peripheral-side executor logic was exercised,
+via a local self-test bypassing the transport). Re-run the "Validation plan
+(hardware)" steps below (extended with a second device / settings-id / a
+real second half) once hardware is available.
 
 Facts about the dependencies below were verified against the checked-out
 sources (paths cited).

@@ -2,9 +2,19 @@
 # This defines max sizes for string fields and max counts for repeated fields
 
 cormoran.pmw3610.ErrorResponse.message        max_size:64
-# Raised from 2 to 4 to support multiple PMW3610 devices in one firmware
-# image (see DESIGN.md Phase F).
-cormoran.pmw3610.GetInfoResponse.devices      max_count:4
-cormoran.pmw3610.DeviceInfo.settings_id       max_size:16
+# Bounded by two things: supporting multiple PMW3610 devices in one
+# firmware image (DESIGN.md Phase F), and -- once
+# CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY is enabled -- ZMK's split relay event
+# transport, whose relay_event_header.event_data_size wire field is a
+# single byte (see zmk/split/transport/types.h), hard-capping any relayed
+# message (GetInfoResponse wrapped in RelayResponse/PeripheralResponse) at
+# 255 bytes regardless of CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN. A
+# BUILD_ASSERT in src/split/pmw3610_relay.c catches an over-budget
+# combination of this max_count and CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN
+# at compile time.
+cormoran.pmw3610.GetInfoResponse.devices      max_count:2
+# max_size is nanopb's max *encoded byte length including the NUL
+# terminator* -- matches PMW3610_SETTINGS_ID_MAX_LEN (8) + 1.
+cormoran.pmw3610.DeviceInfo.settings_id       max_size:9
 cormoran.pmw3610.GetFrameChunkResponse.data    max_size:128
 cormoran.pmw3610.FrameStreamChunk.data         max_size:128

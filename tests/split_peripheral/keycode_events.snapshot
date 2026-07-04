@@ -1,0 +1,2 @@
+PASS: pmw3610_split_relay device_count=0
+PASS: pmw3610_split_relay_unsupported_kind
