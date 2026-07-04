@@ -1214,11 +1214,24 @@ int pmw3610_capture_frame(const struct device *dev,
     pmw3610_set_interrupt(dev, false);
 
     int err = 0;
+    /* Consistency fix from Phase D hardware validation: PIXEL_GRAB/
+     * FRAME_GRAB were the only two register writes in this file using the
+     * raw pmw3610_write_reg() helper directly. Every other write that must
+     * actually latch on the sensor (sample/downshift time, performance,
+     * observation-clear, motion register 0x32, and the generic
+     * pmw3610_write_register() public API) goes through pmw3610_write(),
+     * which brackets the write with PMW3610_REG_SPI_CLK_ON_REQ
+     * enable/disable (+ T_CLOCK_ON_DELAY_US settle). Switched to
+     * pmw3610_write() here for consistency. NOTE: on the Phase D hardware
+     * validation unit, this alone did NOT make PG_VALID assert -- frame
+     * capture is still unvalidated on real hardware (see DESIGN.md/
+     * README.md Phase D notes); this is a correctness/consistency cleanup,
+     * not a confirmed fix. */
     if (p.write_pixel_grab_reset) {
-        err = pmw3610_write_reg(dev, PMW3610_REG_PIXEL_GRAB, 0x00);
+        err = pmw3610_write(dev, PMW3610_REG_PIXEL_GRAB, 0x00);
     }
     if (!err && p.write_frame_grab) {
-        err = pmw3610_write_reg(dev, PMW3610_REG_FRAME_GRAB, p.frame_grab_value);
+        err = pmw3610_write(dev, PMW3610_REG_FRAME_GRAB, p.frame_grab_value);
     }
 
     uint16_t collected = 0;
