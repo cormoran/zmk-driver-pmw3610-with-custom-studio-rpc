@@ -538,6 +538,317 @@ the streaming mechanism end-to-end, use a validation-only build with
 to `build.yaml`) — mirrors the earlier `boot0` scratch-overlay approach for
 the same reason (environment can't do physical/human steps).
 
+## Phase F (design only, not yet implemented): multiple sensors + split peripheral support
+
+Goal: (1) first-class support for **multiple PMW3610 devices per firmware
+image** (per-device settings instead of today's single global set), and
+(2) **split keyboard support** — sensors living on a split *peripheral*
+become visible/controllable through the central's Studio RPC (info,
+diagnostics, registers, frame capture/streaming) and through
+zmk-feature-custom-settings.
+
+Everything below is design; implementation is future work. Facts about the
+dependencies were verified against the checked-out sources (paths cited).
+
+### F.0 Facts this design builds on (verified in dependencies/)
+
+- **Studio RPC runs only on the central**: `app/src/studio/Kconfig` has
+  `select ZMK_STUDIO_RPC if !ZMK_SPLIT || ZMK_SPLIT_ROLE_CENTRAL`. A
+  peripheral never sees RPC requests directly.
+- **ZMK fork has a generic split event relay**
+  (`CONFIG_ZMK_SPLIT_RELAY_EVENT`, `app/include/zmk/event_manager.h`):
+  - `ZMK_RELAY_EVENT_HANDLE(event_type, identifier, source_field_name)` —
+    receive relayed events; on receive the event's `source_field_name` is set
+    to `relay source + 1` (so 0 = raised locally … actually 0 is never set on
+    receive; the *received* value is `peripheral slot + 1` on central, and
+    central-originated events arrive at the peripheral with source `1`).
+    Events raised locally must set the field to
+    `ZMK_RELAY_EVENT_SOURCE_SELF` (0xFF) to be eligible for relaying.
+  - `ZMK_RELAY_EVENT_CENTRAL_TO_PERIPHERAL(type, id, src_field)` /
+    `ZMK_RELAY_EVENT_PERIPHERAL_TO_CENTRAL(type, id, src_field)` — auto-relay
+    a locally-raised ZMK event across the link. Identifier ≤
+    `CONFIG_ZMK_SPLIT_RELAY_EVENT_TYPE_NAME_LEN` (default 4) chars.
+  - Payload ≤ `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` (default 128) bytes;
+    the transport chunks larger-than-MTU payloads itself (sequence + final
+    bit in `relay_event_header`), so raising this config is safe.
+  - Delivery is **best-effort** (`k_msgq_put(..., K_NO_WAIT)` on central,
+    bounded queues) — events can drop under pressure. The design must
+    tolerate lost messages (timeouts, idempotent commands, per-chunk offsets).
+- **zmk-feature-custom-settings already solves split settings**:
+  `CONFIG_ZMK_CUSTOM_SETTINGS_SPLIT_RPC_RELAY`
+  (`dependencies/zmk-feature-custom-settings/src/studio/custom_settings_handler.c`)
+  relays settings RPC to peripherals over the event relay (identifiers
+  `csr`/`csn`) and converts peripheral replies back into Studio
+  *notifications* tagged with `source`. Source addressing is already defined:
+  `ZMK_CUSTOM_SETTING_SOURCE_LOCAL` = 0, peripherals = slot+1,
+  `ZMK_CUSTOM_SETTING_SOURCE_ALL` = UINT32_MAX
+  (`include/cormoran/zmk/custom_settings.h`). Peripheral-targeted list/read
+  results arrive **asynchronously as notifications**, not as the RPC
+  response. Settings themselves live in *each half's own* section iterable +
+  NVS — a peripheral stores and applies its own values locally.
+- `struct zmk_custom_setting.key` is `const char *`
+  (`include/cormoran/zmk/custom_settings.h`), so a key string may live in a
+  module-owned static buffer filled at early boot (before `main()`'s
+  `settings_load()`), enabling runtime-composed per-device keys.
+  `CONFIG_ZMK_CUSTOM_SETTINGS_KEY_MAX_LEN` = 48 (max 48 with protobuf).
+
+### F.1 Per-device settings (multi-sensor, one firmware image)
+
+Today all PMW3610 devices of one image share a single set of global keys
+(`cpi`, `swap_xy`, …) — the change listener re-applies every key to every
+device. Replace with **one settings entry set per DT instance**:
+
+- **Key naming**: `"<param>@<device-id>"` (e.g. `cpi@a3f2`,
+  `rest1_downshift_ms@a3f2`). Longest is `report_interval_min_ms@` (23) +
+  id — keep ids ≤ 8 chars to stay under KEY_MAX_LEN 48. This follows the
+  suggestion to prefer stable name-derived keys over `array_index`:
+  array-style keys (or reusing today's globals with an index) silently
+  re-target when a sensor is added/removed/reordered in DT; name-derived
+  keys survive DT reshuffles.
+- **Device id**: an optional new DT property `settings-id` (string, added to
+  `dts/bindings/cormoran,pmw3610.yml`) for a human-chosen stable id
+  ("trackball", "thumb"); when absent, fall back to a short hash — 4 hex
+  chars of FNV-1a over `DT_NODE_PATH(node)` (path, not node name: two
+  `pmw3610@0` on different SPI buses must not collide). The hash is computed
+  at boot (a `SYS_INIT` at `POST_KERNEL`, i.e. before `main()` runs
+  `settings_load()`), written into per-entry static key buffers that the
+  `zmk_custom_setting.key` pointers reference. Uniqueness is only needed
+  *within one half* (each half has its own NVS + settings registry); the web
+  UI disambiguates across halves by `source`.
+- **Entry generation**: `DT_FOREACH_STATUS_OKAY(cormoran_pmw3610, ...)`
+  expands the 13 per-parameter entries per instance (13 × N
+  `STRUCT_SECTION_ITERABLE`s, same designated-initializer style as today —
+  the nested-compound-literal restriction still applies). Bonus this
+  unlocks: **per-device defaults from DT** — e.g. `force_awake`'s default
+  can finally be that instance's `force-awake` DT property, removing the
+  Phase B caveat where DT `force-awake;` was overridden to `false`.
+- **Apply path**: `pmw3610_settings_apply_to_device(dev)` reads that
+  device's own keys (compose key from the device's id). The
+  `zmk_custom_setting_changed` listener parses the key suffix and re-applies
+  to the *matching device only* (fall back to "apply all" is no longer
+  needed).
+- **API addition**: `pmw3610_get_settings_id(dev, buf, len)` (or expose the
+  id table) in `pmw3610_api.h` so the RPC handler can report each device's
+  id (see F.3 — the web UI needs it to group settings per device).
+- **Migration / compatibility**: this is a breaking change for persisted
+  values (old global `cpi` etc. become orphaned; devices fall back to
+  defaults). Given the module is pre-1.0 and settings are trivially re-set
+  from the web UI, accept the break and document it in README (mention
+  `resetSettings` / re-save). A read-legacy-key-on-first-boot shim is
+  possible but not worth the code.
+
+Split note: **nothing else is needed for settings on peripherals.** The
+peripheral image compiles its own entries from its own DT; custom-settings'
+split relay (`CONFIG_ZMK_CUSTOM_SETTINGS_SPLIT_RPC_RELAY` on both halves +
+`CONFIG_ZMK_SPLIT_RELAY_EVENT`) exposes them to the Studio client with
+`source` addressing, values persist in the peripheral's own flash, and this
+module's (peripheral-side) change listener applies them locally. The work is
+config + docs + web UI plumbing, not firmware code.
+
+### F.2 Split RPC bridge (info / diagnostics / registers / frames)
+
+The `cormoran__pmw3610` Studio subsystem keeps running only on the central.
+Peripheral sensors are reached via a module-owned pair of relayed events
+mirroring the custom-settings pattern (`custom_settings_handler.c` is the
+reference implementation to copy):
+
+- **New proto file** `proto/cormoran/pmw3610/pmw3610_relay.proto` (nanopb on
+  both halves):
+
+  ```proto
+  message RelayRequest  { uint32 request_id = 1; Request request  = 2; }
+  message RelayResponse { uint32 request_id = 1; Response response = 2; }
+  // FrameStreamChunk notifications are relayed as-is (no request_id).
+  message RelayNotification { Notification notification = 1; }
+  ```
+
+- **New relayed ZMK events** (identifiers ≤ 4 chars, `source` field
+  mandatory for bidirectional safety):
+
+  ```c
+  struct zmk_pmw3610_relay_request  { uint8_t source; uint8_t size; uint8_t payload[..]; };
+  struct zmk_pmw3610_relay_response { uint8_t source; uint8_t size; uint8_t payload[..]; };
+  ZMK_RELAY_EVENT_HANDLE(zmk_pmw3610_relay_request,  pmq, source);
+  ZMK_RELAY_EVENT_HANDLE(zmk_pmw3610_relay_response, pmp, source);
+  ZMK_RELAY_EVENT_CENTRAL_TO_PERIPHERAL(zmk_pmw3610_relay_request,  pmq, source);
+  ZMK_RELAY_EVENT_PERIPHERAL_TO_CENTRAL(zmk_pmw3610_relay_response, pmp, source);
+  ```
+
+  `payload` is the nanopb-encoded Relay{Request,Response,Notification};
+  `BUILD_ASSERT` the max encoded sizes against
+  `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` exactly like custom-settings does.
+
+- **Addressing**: every device-targeted proto request gains a `source`
+  field (`uint32`, 0 = local/central, N = peripheral slot N — **same
+  convention as custom-settings** so one mental model covers both
+  subsystems). `device_index` stays and is interpreted *within* that
+  source's device list. `GetInfoRequest` stays broadcast (see below).
+
+- **Async model** (per the "指示は relay、結果は notification" direction —
+  and forced by the transport anyway): RPC dispatch is synchronous, relay
+  round-trips are not, so a peripheral-targeted request returns
+  **immediately** with a new `DeferredResponse { uint32 request_id; }`; the
+  real payload arrives later as a Studio notification:
+
+  ```proto
+  message PeripheralResponse { uint32 source = 1; uint32 request_id = 2; Response response = 3; }
+  message Notification {
+      oneof notification_type {
+          FrameStreamChunk frame_stream_chunk = 1;   // gains: uint32 source
+          PeripheralResponse peripheral_response = 2;
+          DeviceInventoryChanged device_inventory_changed = 3; // empty; “re-GetInfo”
+      }
+  }
+  ```
+
+  `request_id` is a central-assigned monotonically increasing counter.
+  Requests targeting `source == 0` keep today's fully synchronous behavior
+  (zero change for non-split users). Central keeps a small fixed-size table
+  of in-flight relayed request ids (for logging/timeout only — correlation
+  is the client's job; entries expire after ~5s, matching the frame-capture
+  deadline).
+
+- **Peripheral executor** (`src/split/pmw3610_relay_peripheral.c`): listener
+  for `zmk_pmw3610_relay_request` decodes the inner `Request`, runs the
+  *existing* handler logic against local devices (refactor
+  `pmw3610_handler.c`'s per-request functions into a transport-independent
+  core, e.g. `src/studio/pmw3610_request_exec.c`, so central RPC and
+  peripheral relay share one implementation), encodes the `Response` into a
+  `RelayResponse`, raises it with `source = ZMK_RELAY_EVENT_SOURCE_SELF` for
+  relaying up. Executor work runs on the system workqueue (frame capture
+  blocks up to ~5s — must not run in the BLE RX path; a 1-deep pending-work
+  model with "busy" `ErrorResponse` for overlapping requests is enough).
+- **Central bridge** (`src/split/pmw3610_relay_central.c`): forwards
+  peripheral-targeted requests; on `zmk_pmw3610_relay_response`, wraps the
+  decoded payload in `PeripheralResponse{source = ev.source}` and raises it
+  as a custom Studio notification (same
+  `raise_zmk_studio_custom_notification` path Phase E uses).
+
+- **Device inventory**: `GetInfoResponse.DeviceInfo` gains `source`,
+  `device_index`, `name` (`dev->name`), `settings_id` (F.1), and the
+  response gains a per-source `reachable` flag. Central answers `GetInfo`
+  from local devices + a **cached** peripheral inventory. The cache is
+  filled by peripherals *announcing* their device list (an unsolicited
+  `RelayResponse` carrying `GetInfoResponse`, request_id 0 = announce) when
+  the split link connects (peripheral subscribes to
+  `zmk_split_peripheral_status_changed`), and refreshed on demand: a
+  peripheral-targeted `GetInfo{source=N}` follows the normal deferred path.
+  Central raises `DeviceInventoryChanged` when the cache changes (announce
+  received / peripheral disconnected) so the web UI re-queries.
+
+- **Frame streaming from a peripheral**: `SetFrameStream{source=N}` is
+  relayed like any command; the *existing* Phase E capture loop runs on the
+  peripheral; each chunk is raised locally as `RelayNotification
+  {FrameStreamChunk}` → relayed up → central re-raises it as the usual
+  Studio notification with `source` filled in. Constraints:
+  - Chunk payload must fit one relay event: require
+    `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN ≥ 160` when
+    `ZMK_PMW3610_SPLIT_RPC_RELAY` is on (BUILD_ASSERT), keeping the 128-byte
+    chunk size uniform end-to-end (encoded chunk ≈ 128 + ~20B proto/envelope
+    overhead). custom-settings documents the same "raise DATA_LEN" pattern.
+  - Loss tolerance: chunks may drop (best-effort relay). The web assembler
+    already only completes a frame when all bytes arrived; add a client-side
+    stale-frame drop (new `frame_id` or timeout discards a partial frame).
+    No firmware retransmit.
+  - Keep the "one active stream per firmware image" rule per half
+    (peripheral enforces locally), but the *central* additionally tracks a
+    single global active stream target to keep UI semantics identical.
+  - **Lock/disconnect stops**: central's existing lock listener additionally
+    relays `SetFrameStream{enable:false}` to the streaming peripheral;
+    the peripheral independently force-stops its stream when the split link
+    drops (its `zmk_split_peripheral_status_changed` listener) — covers the
+    "central rebooted / out of range while streaming" hole.
+
+### F.3 Kconfig / build changes
+
+- `ZMK_PMW3610_PROTOBUF` (internal, promptless): owns nanopb generation of
+  `pmw3610.proto` + `pmw3610_relay.proto`. Selected by both options below.
+  Today generation is tied to `ZMK_PMW3610_STUDIO_RPC`; a peripheral has no
+  Studio, so this decoupling is required (mirrors
+  `ZMK_CUSTOM_SETTINGS_PROTOBUF`).
+- `ZMK_PMW3610_STUDIO_RPC` — unchanged semantics (central / non-split).
+- `ZMK_PMW3610_SPLIT_RPC_RELAY` — `depends on ZMK_SPLIT_RELAY_EVENT`,
+  selects `ZMK_PMW3610_PROTOBUF`. Compiles the common event glue plus, by
+  role: central bridge (`ZMK_SPLIT_ROLE_CENTRAL`, additionally requires
+  `ZMK_PMW3610_STUDIO_RPC`) or peripheral executor. Enabled on **both**
+  halves.
+- Settings: no new symbol — `ZMK_PMW3610_CUSTOM_SETTINGS` on both halves +
+  `ZMK_CUSTOM_SETTINGS_SPLIT_RPC_RELAY` (dependency's own symbol) on both.
+- README gains a split section: required configs per half, DATA_LEN ≥ 160,
+  and the reminder that `&studio_unlock` lives on whichever half has the
+  keymap position — lock state is central-only, unaffected by this design.
+
+### F.4 Web UI changes
+
+- **Device model**: selector becomes a flat list of
+  `{source, device_index, name, settings_id}` built from the extended
+  `GetInfo`; refreshed on `DeviceInventoryChanged` notifications.
+- **Async correlation helper** (`web/src/relay.ts`, pure + unit-testable): a
+  pending-request map `request_id → {resolve, reject, deadline}` fed by
+  `PeripheralResponse` notifications; peripheral-targeted calls return a
+  promise that resolves on the matching notification or rejects on timeout
+  (~6s > firmware's 5s capture deadline). Local calls bypass it.
+- **FrameViewer**: chunks are demuxed by `source`; one assembler per active
+  stream; stale-frame drop as in F.2. Streaming FPS over BLE relay is
+  bounded by capture time (~2s/frame) — no UI pacing needed.
+- **SettingsPanel**: group keys by `settings_id` suffix into per-device
+  cards; pass `source` through the custom-settings RPC calls (SettingRef/
+  SettingScope already carry `source` in the dependency's proto); handle the
+  dependency's async notification-based replies for peripheral sources.
+
+### F.5 Tests
+
+- **Unit (native_sim)**: keep `tests/studio` (central, source=0 unchanged);
+  add `tests/split_peripheral` modeled on
+  `dependencies/zmk-feature-custom-settings/tests/split_peripheral` (builds
+  with `CONFIG_ZMK_SPLIT=y`, `CONFIG_ZMK_SPLIT_RELAY_EVENT=y`, peripheral
+  role, zero devices): boots the executor, feeds it synthetic
+  `zmk_pmw3610_relay_request` events (add a test-only injector, as the Dev
+  Rules suggest), asserts encoded `RelayResponse` events come back
+  (GetInfo announce, error path for bad device_index).
+- **Build tests** (`tests/zmk-config`): add split artifacts — e.g.
+  `pmw3610_split_central` (RPC + relay + settings relay) and
+  `pmw3610_split_peripheral` (driver + relay + settings relay, sensor
+  overlay on the peripheral) on a split-capable shield; `test.py` asserts
+  the relay configs and device nodes are present in each half's build.
+- **Web**: unit tests for the correlation map (resolve/timeout/unknown id)
+  and per-source frame demux/stale-frame drop (extend `frame.ts` tests).
+
+### F.6 Implementation order (per Dev Rules: proto → firmware → web)
+
+1. **F-a** Per-device settings keys + `settings_id`/`name` in GetInfo
+   (local-only; no split yet). Breaking-change note in README.
+2. **F-b** Relay proto + Kconfig split (`ZMK_PMW3610_PROTOBUF`) + handler
+   refactor into transport-independent executor. No behavior change.
+3. **F-c** Peripheral executor + central bridge for
+   GetInfo/ReadDiagnostics/Read+WriteRegister (deferred responses,
+   inventory announce/cache). Unit + build tests.
+4. **F-d** Frame capture + streaming over relay, lock/disconnect stop
+   paths.
+5. **F-e** Web UI (device model, correlation helper, per-device settings
+   cards, frame demux) + web tests + README split guide.
+
+### F.7 Risks / open questions
+
+- **Best-effort relay**: dropped announce → central shows a reachable
+  peripheral with no devices; mitigated by on-demand `GetInfo{source=N}`
+  re-query from the UI. Dropped `RelayResponse` → client timeout (surfaced
+  as a retryable error). Acceptable for a diagnostics tool.
+- **Relay payload sizing**: `Response` for `GetInfo` with many devices may
+  exceed one relay event even at DATA_LEN 160 — cap `.options`
+  `max_count` for relayed GetInfo (e.g. 4 devices/half) and BUILD_ASSERT
+  encoded max size. To be pinned down when writing the `.options` file.
+- **Peripheral flash wear**: settings persist on the peripheral's NVS —
+  same behavior as central today, no new mechanism.
+- **Security**: relayed commands originate only from the central's SECURED
+  RPC handlers, so the lock gate is preserved; the peripheral trusts the
+  split link exactly as ZMK's own split features do (keystrokes flow over
+  the same trust boundary).
+- **ID collisions**: 4-hex FNV over node paths within one half — collision
+  chance is negligible for realistic sensor counts (≤4/half); detect at
+  boot (log + keep first) and let `settings-id` override as the escape
+  hatch.
+
 ## Validation plan (hardware)
 
 1. `python3 -m unittest` (build tests + native_sim unit tests).
