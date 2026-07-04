@@ -1,0 +1,67 @@
+/*
+ * Phase E: override tester_xiao's own keymap (shipped in the ZMK fork) so
+ * the test firmware can actually be physically unlocked for ZMK Studio.
+ *
+ * A `.keymap` file placed in the ZMK_CONFIG config directory (this file)
+ * takes precedence over the shield's own `.keymap` -- ZMK's
+ * `boards/post_boards_shields.cmake` builds `KEYMAP_DIRS` with `ZMK_CONFIG`
+ * *prepended* ahead of the shield/board directories, then picks the first
+ * `<candidate>.keymap` match, so this file is found and used instead of
+ * dependencies/zmk/app/boards/shields/tester_xiao/tester_xiao.keymap.
+ *
+ * tests/zmk-config/snippets/pmw3610-trackball/pmw3610-trackball.overlay
+ * restricts tester_xiao's kscan and matrix transform to D0-D3 (4 physical
+ * positions actually wired), but tester_xiao's own physical layout
+ * (tester_xiao-layouts.dtsi) still declares all 11 keys -- ZMK's keymap
+ * init indexes bindings by physical-layout key count, not transform
+ * position count, so this keymap must keep all 11 entries (only position 0
+ * changes to `&studio_unlock`, was `&pin0`) or it reads past the end of the
+ * DTS-sized bindings array and hard-faults during boot (do_device_init).
+ */
+
+#include <behaviors.dtsi>
+#include <dt-bindings/zmk/keys.h>
+
+#define PIN_MACRO(name, pin) \
+/ { \
+    macros { \
+        name: name { \
+            compatible = "zmk,behavior-macro"; \
+            wait-ms = <5>; \
+            tap-ms = <5>; \
+            #binding-cells = <0>; \
+            bindings = <&kp P &kp I &kp N &kp SPACE>, pin, <&kp ENTER>; \
+        }; \
+    }; \
+};
+
+PIN_MACRO(pin1, <&kp N1>)
+PIN_MACRO(pin2, <&kp N2>)
+PIN_MACRO(pin3, <&kp N3>)
+PIN_MACRO(pin4, <&kp N4>)
+PIN_MACRO(pin5, <&kp N5>)
+PIN_MACRO(pin6, <&kp N6>)
+PIN_MACRO(pin7, <&kp N7>)
+PIN_MACRO(pin8, <&kp N8>)
+PIN_MACRO(pin9, <&kp N9>)
+PIN_MACRO(pin10, <&kp N1 &kp N0>)
+
+/ {
+    keymap {
+        compatible = "zmk,keymap";
+
+        default_layer {
+            bindings = <&studio_unlock
+                        &pin1
+                        &pin2
+                        &pin3
+                        &pin4
+                        &pin5
+                        &pin6
+                        &pin7
+                        &pin8
+                        &pin9
+                        &pin10>;
+        };
+    };
+};

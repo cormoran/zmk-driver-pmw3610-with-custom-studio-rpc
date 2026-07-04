@@ -1,7 +1,7 @@
 # Delete all unused properties.
 
 # Give your module a name
-name: zmk-module-template-rename-please
+name: zmk-driver-pmw3610-with-custom-studio-rpc
 build:
   # List your dependencies
   # depends:

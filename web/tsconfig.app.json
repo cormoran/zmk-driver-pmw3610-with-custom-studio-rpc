@@ -20,7 +20,13 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "erasableSyntaxOnly": true,
+    // NOTE: erasableSyntaxOnly deliberately disabled (unlike the module
+    // template default) -- ts-proto emits real `enum` declarations (not
+    // erasable-only syntax) for the custom-settings proto's SettingWriteMode/
+    // SettingConfidentiality/etc. enums, generated from
+    // proto/cormoran/zmk/custom_settings/custom_settings.proto (vendored via
+    // web/buf.gen.yaml's second input directory, see that file). This repo's
+    // own pmw3610.proto has no enums, so this was previously unnoticed.
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },

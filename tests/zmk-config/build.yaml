@@ -1,21 +1,39 @@
 include:
-  - artifact: module_template_board_feature_disabled
+  - artifact: pmw3610_disabled
     board: xiao_ble//zmk
     shield: tester_xiao
 
-  - artifact: module_template_board_with_rpc
+  - artifact: pmw3610_plain
     board: xiao_ble//zmk
     shield: tester_xiao
-    cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_TEMPLATE_FEATURE=y -DCONFIG_ZMK_TEMPLATE_FEATURE_STUDIO_RPC=y
-    snippet: studio-rpc-usb-uart
+    snippet: pmw3610-trackball
 
-  - artifact: module_template_board_without_rpc
+  # Burst read OFF coverage (pmw3610_plain above is burst read ON, the
+  # normal/recommended mode -- see the snippets' overlay comments). Only
+  # the plain motion-reporting artifact is duplicated since burst read only
+  # affects pmw3610_report_data()'s SPI transfer shape, not RPC/settings.
+  - artifact: pmw3610_plain_no_burst
     board: xiao_ble//zmk
     shield: tester_xiao
-    cmake-args: -DCONFIG_ZMK_TEMPLATE_FEATURE=y
+    snippet: pmw3610-trackball-no-burst
 
-  - artifact: custom_settings_board
+  - artifact: pmw3610_rpc
     board: xiao_ble//zmk
     shield: tester_xiao
-    cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_TEMPLATE_FEATURE=y -DCONFIG_ZMK_TEMPLATE_FEATURE_STUDIO_RPC=y -DCONFIG_ZMK_CUSTOM_SETTINGS=y -DCONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC=y
-    snippet: studio-rpc-usb-uart
+    cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_PMW3610_STUDIO_RPC=y
+    snippets:
+      - studio-rpc-usb-uart
+      - pmw3610-trackball
+
+  - artifact: pmw3610_settings_rpc
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    cmake-args: >-
+      -DCONFIG_ZMK_STUDIO=y
+      -DCONFIG_ZMK_PMW3610_STUDIO_RPC=y
+      -DCONFIG_ZMK_CUSTOM_SETTINGS=y
+      -DCONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC=y
+      -DCONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y
+    snippets:
+      - studio-rpc-usb-uart
+      - pmw3610-trackball

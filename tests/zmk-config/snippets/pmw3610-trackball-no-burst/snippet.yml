@@ -1,0 +1,4 @@
+name: pmw3610-trackball-no-burst
+append:
+  EXTRA_CONF_FILE: pmw3610-trackball-no-burst.conf
+  EXTRA_DTC_OVERLAY_FILE: pmw3610-trackball-no-burst.overlay

@@ -1,0 +1,568 @@
+# zmk-driver-pmw3610-with-custom-studio-rpc — Design
+
+ZMK module providing the PMW3610 optical sensor driver with:
+
+1. Runtime-configurable settings stored via
+   [zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings),
+   applied to the sensor at boot and whenever changed over RPC.
+2. A custom Studio RPC subsystem (`cormoran__pmw3610`) for sensor info,
+   diagnostics, raw register access, and frame (image) capture.
+3. A web UI (WebSerial) to edit settings and view streamed sensor images.
+
+Based on [cormoran/zmk-pmw3610-driver](https://github.com/cormoran/zmk-pmw3610-driver)
+(driver core, DT compat `cormoran,pmw3610` is kept identical — this module is a
+drop-in replacement and MUST NOT be used together with the original module).
+
+## Naming
+
+| Item | Value |
+| --- | --- |
+| Zephyr module name | `zmk-driver-pmw3610-with-custom-studio-rpc` |
+| Custom subsystem id | `cormoran__pmw3610` |
+| Proto package | `cormoran.pmw3610` |
+| Proto path | `proto/cormoran/pmw3610/pmw3610.proto` |
+| DT compatible | `cormoran,pmw3610` (unchanged) |
+| Settings subsystem id | `cormoran__pmw3610` (keys below) |
+
+## Kconfig
+
+- `PMW3610` — driver core (same options as the original driver; Kconfig values
+  remain the *defaults* for runtime settings).
+- `ZMK_PMW3610_CUSTOM_SETTINGS` — runtime settings integration.
+  `depends on ZMK_CUSTOM_SETTINGS` (not `PMW3610`, so it also builds/works
+  with zero PMW3610 devices, e.g. native_sim -- mirrors `ZMK_PMW3610_STUDIO_RPC`).
+- `ZMK_PMW3610_STUDIO_RPC` — custom Studio RPC subsystem.
+  `depends on ZMK_STUDIO` (not `PMW3610`, same reasoning).
+- `ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE` — frame pixel buffer (default 484 = 22x22).
+
+CMake: driver sources compile under `CONFIG_PMW3610`; `src/studio/*` and nanopb
+proto generation only under `CONFIG_ZMK_PMW3610_STUDIO_RPC`; settings glue
+(`src/settings/pmw3610_settings.c`) under `CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS`.
+
+## Driver changes (src/pmw3610.c)
+
+- Fix latent bug: `DT_FOREACH_STATUS_OKAY(pixart_pmw3610, ...)` →
+  `cormoran_pmw3610` (activity listener array was always empty). (Already
+  fixed in Phase A.)
+- Runtime config lives in `pixart_data.runtime` (a `struct
+  pixart_runtime_config`, `src/pixart.h`), seeded from Kconfig/DT in
+  `pmw3610_init()`: cpi, swap_xy, invert_x, invert_y, force_awake,
+  smart_algorithm, run/rest1/rest2 downshift ms, rest1/2/3 sample ms, report
+  interval min ms.
+- A per-device `struct k_mutex lock` in `pixart_data` guards composite
+  register sequences (multi-write CPI, the clock-on/off wrapped `pmw3610_write`
+  helper used by downshift/sample/performance/smart-algorithm writes, and
+  reads of the runtime struct) against concurrent access from the Studio RPC
+  thread while the trigger work runs on the system workqueue. SPI bus
+  arbitration alone does not serialize *sequences* of transactions.
+- Public API (`include/cormoran/pmw3610/pmw3610_api.h`):
+  - `pmw3610_device_count()` / `pmw3610_get_device(index)` (existing).
+  - `pmw3610_is_ready(dev)`, `pmw3610_get_init_error(dev)` (existing).
+  - `pmw3610_read_register` / `pmw3610_write_register(dev, addr, value)` (new
+    write) -- both mutex-guarded.
+  - `pmw3610_read_diagnostics(dev, struct pmw3610_diagnostics *out)` — SQUAL
+    (0x06), shutter hi/lo (0x07/0x08), pix max/avg/min (0x09/0x0A/0x0B).
+  - `pmw3610_get_runtime_config(dev, struct pmw3610_runtime_config *out)`.
+  - Setters (validate → update runtime value → push to sensor immediately
+    if `data->ready`; otherwise only the in-memory value is updated, and it
+    is applied to hardware by `pmw3610_async_init_configure()` once the
+    async init reaches its CONFIGURE step):
+    `pmw3610_set_cpi_runtime`, `pmw3610_set_run_downshift_ms`,
+    `pmw3610_set_rest1_downshift_ms`, `pmw3610_set_rest2_downshift_ms`,
+    `pmw3610_set_rest1_sample_ms`, `pmw3610_set_rest2_sample_ms`,
+    `pmw3610_set_rest3_sample_ms`, `pmw3610_set_axis_flags`,
+    `pmw3610_set_force_awake`, `pmw3610_set_smart_algorithm`,
+    `pmw3610_set_report_interval_min`.
+  - `pmw3610_capture_frame(dev, buf, count, &out_count)` — Phase C, not yet
+    implemented.
+- `pmw3610_async_init_configure` applies the *runtime* config (overlaid with
+  effective custom-setting values when `CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS`
+  is enabled -- see "Settings" below for exactly how/when), so boot-time
+  application is inherent to the normal init flow, not a separate step.
+- The `#if CONFIG_PMW3610_REPORT_INTERVAL_MIN > 0` compile-time blocks in the
+  report path became a runtime `if (report_interval_min_ms > 0)` check
+  (semantics unchanged when the value is fixed at build time and equal).
+- `dx`/`dy` accumulators (and `last_smp_time`/`last_rpt_time`, previously
+  `static` inside `pmw3610_report_data`) moved into `pixart_data` (bugfix for
+  multi-instance cross-talk).
+- `pmw3610_set_performance` semantics changed slightly: it now takes the
+  *runtime* force-awake flag explicitly as a parameter (instead of reading
+  `config->force_awake`, the DT-only value) — callers
+  (`pmw3610_async_init_configure`, `pmw3610_set_force_awake`,
+  `on_activity_state`) pass `data->runtime.force_awake`. Behavior when the
+  flag is false is unchanged (register untouched); the activity-listener
+  interaction is preserved (active/inactive still maps to
+  force-awake-enabled/disabled while the runtime flag is on).
+
+## Settings (src/settings/pmw3610_settings.c)
+
+Settings entries for subsystem `cormoran__pmw3610`, all RPC_PUBLIC + UNSECURE,
+with range constraints:
+
+| key | type | default | constraint |
+| --- | --- | --- | --- |
+| `cpi` | int32 | 600 (DT default) | 200..3200 |
+| `swap_xy` / `invert_x` / `invert_y` | bool | Kconfig | — |
+| `force_awake` | bool | `false` (see note below) | — |
+| `smart_algorithm` | bool | Kconfig | — |
+| `run_downshift_ms` | int32 | Kconfig (128) | 32..8160 |
+| `rest1_downshift_ms` | int32 | Kconfig (5000) | `16*sample`..`255*16*sample` using the *default* rest1 sample time |
+| `rest2_downshift_ms` | int32 | Kconfig (17000) | `128*sample`..`255*128*sample` using the *default* rest2 sample time |
+| `rest1_sample_ms` / `rest2_sample_ms` / `rest3_sample_ms` | int32 | Kconfig (40/100/500) | 10..2550 |
+| `report_interval_min_ms` | int32 | Kconfig | 0..1000 |
+
+Deviation from the original plan: entries are defined with
+`STRUCT_SECTION_ITERABLE(zmk_custom_setting, ...)` directly (matching the
+pattern in zmk-feature-custom-settings' own
+`src/test/zmk_config_sample_settings.c`), **not** via the
+`ZMK_CUSTOM_SETTING_DEFINE()` convenience macro. Reason: that macro's
+constraint argument ends up inside another static array initializer
+(`_name##_constraints[] = {__VA_ARGS__}`), and `ZMK_CUSTOM_SETTING_RANGE_INT32()`
+expands to a compound literal whose `.range.min`/`.range.max` members are
+*themselves* compound literals (via `ZMK_CUSTOM_SETTING_VALUE_INT32()`).
+Nested compound literals are not valid in a static/file-scope initializer
+per C11 6.6p9, and `arm-zephyr-eabi-gcc` 12.2.0 enforces this strictly
+("initializer element is not constant"), even though the pattern is present
+verbatim in the dependency's own `src/test/custom_settings_test.c`. Plain
+designated-initializer syntax (`{.type = ZMK_CUSTOM_SETTING_CONSTRAINT_RANGE,
+.range = {.min = {...}, .max = {...}}}`, no compound-literal casts) avoids the
+problem and is what this module uses. **If a future zmk-feature-custom-settings
+version fixes/works around this, `ZMK_CUSTOM_SETTING_DEFINE()` could be used
+again** — worth revisiting.
+
+`force_awake`'s setting default is a compile-time `false`, independent of any
+per-device DT `force-awake` property (a custom setting default must be a
+single value shared by all devices of a subsystem, while `force-awake` is a
+per-device DT property). A device with `force-awake;` in its DT node boots
+with force-awake enabled (seeded in `pmw3610_init()`), but once
+`CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS` is enabled, `pmw3610_async_init_configure()`
+overlays the *setting's* effective value (`false` unless explicitly changed)
+before the sensor is configured — i.e. the DT property is effectively
+overridden to disabled the first time settings are applied. Documented in
+README.md; users who want force-awake on by default with custom settings
+enabled should set the `force_awake` setting via RPC/persisted storage,
+not (only) the DT property.
+
+### Boot-apply mechanism (deviates from the original plan)
+
+The original plan was a `SYS_INIT(APPLICATION, 99)` hook in the settings
+module that iterates devices and applies effective setting values, relying
+on boot-order timing (the hook would run before the ~260ms-delayed async
+init CONFIGURE step, but *after* `custom_settings_init()`'s own
+`SYS_INIT(APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY)`, and hopefully
+after `main()`'s `settings_load()` too, since persisted values only become
+available then).
+
+Investigation of the actual boot sequence
+(`dependencies/zmk/app/src/main.c`, `dependencies/zmk-feature-custom-settings/src/custom_settings.c`):
+
+1. `POST_KERNEL`: `pmw3610_init()` seeds `pixart_data.runtime` from Kconfig/DT
+   and schedules the async init work (first step fires after
+   `10 + CONFIG_PMW3610_INIT_POWER_UP_EXTRA_DELAY_MS` ms; the CONFIGURE step
+   -- where runtime config is pushed to hardware -- only runs after the
+   `POWER_UP` (≥10ms) → `CLEAR_OB1` (200ms) → `CHECK_OB1` (50ms) steps, i.e.
+   **~260ms after driver init**, all via `k_work_schedule` on the system
+   workqueue).
+2. `APPLICATION`: `custom_settings_init()` resets every setting's
+   `memory_value`/`persistent_value` to its compiled-in `default_value` and
+   sets `has_persistent_value = false`. **No persisted values are loaded
+   here.**
+3. `main()` (runs after all `SYS_INIT` levels, i.e. after every module's
+   `POST_KERNEL`/`APPLICATION` init has completed) calls
+   `settings_subsys_init()` then `settings_load()`, which is what actually
+   reads persisted values from flash via each subsystem's registered
+   `SETTINGS_STATIC_HANDLER_DEFINE` `H_SET` callback
+   (`custom_settings_handle_set()` for `zmk-feature-custom-settings`). This
+   handler mutates `memory_value`/`persistent_value` directly -- it does
+   **not** call `zmk_custom_setting_write()`, so **no
+   `zmk_custom_setting_changed` event fires for values loaded this way.**
+
+So there are two ordering hazards with a `SYS_INIT`-based apply hook: (a) it
+must run after `custom_settings_init()` (same init level, priority-ordered --
+fragile to get right across module boundaries) and (b) it must run after
+`main()`'s `settings_load()`, which is not a `SYS_INIT` step at all and has
+no Kconfig priority to hook into.
+
+**Chosen mechanism**: instead of a separate hook, the driver itself calls
+`pmw3610_settings_apply_to_device(dev)` (declared in
+`include/cormoran/pmw3610/pmw3610_settings_apply.h`, implemented in
+`src/settings/pmw3610_settings.c`, called only when
+`IS_ENABLED(CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS)`) from inside
+`pmw3610_async_init_configure()`, immediately before applying the runtime
+config to hardware. Since that function only runs from the async init work
+queued ~260ms after `POST_KERNEL`, and `main()` (which runs `settings_load()`)
+executes synchronously right after all `SYS_INIT` levels complete -- i.e.
+enormously earlier than 260ms of wall-clock boot time in any realistic
+scenario -- `settings_load()` is guaranteed to have already returned by the
+time `pmw3610_async_init_configure()` runs. This closes the race **by
+construction** (correct call order in one code path) rather than by relying
+on two independently-configured `SYS_INIT` priorities happening to line up.
+The setters called by `pmw3610_settings_apply_to_device()` store the runtime
+value unconditionally and only push to hardware if `data->ready` (false at
+this point), so this call only updates the in-memory `pixart_data.runtime`
+struct, which is then applied to hardware by the rest of
+`pmw3610_async_init_configure()` right after.
+
+**Change handling** (post-boot): a `zmk_custom_setting_changed` listener
+(`pmw3610_settings_changed_listener`, subscribed via `ZMK_SUBSCRIPTION`) checks
+`ev->setting->custom_subsystem_id` against `"cormoran__pmw3610"` and, on a
+match, re-applies *all* keys' current effective values to *all* PMW3610
+devices (simple and correct, if slightly wasteful; settings changes are rare
+interactive events, not a hot path). This handles VALUE_UPDATED / SAVED /
+DISCARDED / RESET uniformly since all four just mean "re-read the effective
+value and push it."
+
+Settings get/set/save/discard/reset/export over RPC is provided generically
+by zmk-feature-custom-settings' own subsystem — this module does not
+duplicate it.
+
+## Frame capture
+
+The Phase C implementation guessed a "common PixArt pixel-grab convention"
+(write `PIXEL_GRAB` = 0x00, poll bit7) because only the 8-page public
+datasheet was available; Phase D hardware validation showed PG_Valid never
+asserts with that sequence. The full PMW3610 datasheet (R2.4, PIXEL_GRAB
+register usage section) documents the official `Pixel_Grab` procedure,
+which Phase D implemented and validated on hardware:
+
+1. Write `0x41` = `0xBA` (SPI clock on request)
+2. Write `0x7F` = `0xFF` (select page 1)
+3. Write `0xB4` = `0xD7` (page-1 magic enable)
+4. Write `0x7F` = `0x00` (back to page 0)
+5. Write `0x41` = `0xB5` (SPI clock off)
+6. Write `0x32` = `0x90` (test clock on)
+7. Write `0x35` = `0x01` (arm pixel grab)
+8. Read `0x47` until bit1 set (else wait 10ms, re-check; bounded)
+9. Read `0x2D` until bit2 set (else wait 10ms, re-check; bounded)
+10. Read `0x35` → one raw byte (bit7 = PG_Valid, bits[6:0] = pixel)
+11. Write `0x2D` = `0x01` (advance to the next pixel)
+    — repeat 9-11 for the full frame (484 = 22x22, datasheet Figure 17)
+12. Read `0x47`; bit0 set = all 484 pixels read successfully (reported as
+    `complete` in the RPC response, along with the measured `duration_ms`)
+
+Driver-side wrapper behavior (`pmw3610_capture_frame()` in
+`src/pmw3610.c`), unchanged from Phase C where still applicable:
+
+- Require `data->ready` (else `-EBUSY`); take `data->lock`, set
+  `data->capture_active = true` (checked and short-circuited by
+  `pmw3610_report_data()`, belt-and-braces alongside disabling the IRQ),
+  release the lock, then `pmw3610_set_interrupt(dev, false)`.
+- The arm sequence (steps 1-7) uses **raw** `pmw3610_write_reg()` calls,
+  NOT the `pmw3610_write()` clk-on/off wrapper -- the datasheet sequence
+  manages the 0x41 SPI clock request itself (steps 1 and 5).
+- Per-pixel ready waits (steps 8/9) sleep 10ms per retry, bounded by
+  `max_invalid_retries` (reinterpreted in Phase D: number of 10ms wait
+  retries per pixel, default 3, clamped 1..100) and an unconditional
+  wall-clock deadline (`PMW3610_FRAME_CAPTURE_TIMEOUT_MS` = 5000ms), so
+  the Studio RPC thread can never be blocked indefinitely.
+- Raw bytes (bit7 kept) are stored; the host masks/interprets.
+- Regardless of success/failure/timeout: re-take the lock, reset the async
+  init state machine to step 0 (the datasheet requires a reset to resume
+  navigation after a pixel grab -- exactly the not-ready path of
+  `pmw3610_resume()`), reset `data->sw_smart_flag` (the capture wrote
+  `0x32`, which the smart-algorithm logic tracks via that flag; the
+  re-init's power-up reset clears the sensor-side register so the
+  host-side flag must follow), clear `capture_active`, release the lock.
+  The motion IRQ is re-enabled once async init reaches its last step.
+
+Pixel count is a request parameter (default 484 = 22x22, clamped to the
+firmware's static frame buffer, `CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE`).
+The Phase C procedure-tuning knobs (`write_frame_grab`/`frame_grab_value`/
+`skip_pixel_grab_reset`) were removed in Phase D (proto field numbers 4-6
+reserved) -- the official sequence is fixed by the datasheet and needs no
+tuning; only `pixel_count` and `max_invalid_retries` remain.
+
+## RPC proto (`cormoran.pmw3610`)
+
+```proto
+Request  = oneof { GetInfoRequest, ReadDiagnosticsRequest, CaptureFrameRequest,
+                   GetFrameChunkRequest, ReadRegisterRequest, WriteRegisterRequest,
+                   SetFrameStreamRequest }
+Response = oneof { ErrorResponse, GetInfoResponse, ReadDiagnosticsResponse,
+                   CaptureFrameResponse, GetFrameChunkResponse,
+                   ReadRegisterResponse, WriteRegisterResponse,
+                   SetFrameStreamResponse }
+Notification = oneof { FrameStreamChunk } // top-level message, Phase E
+```
+
+- `GetInfo` → per-device: ready flag, product id, revision id, init error,
+  and a `RuntimeConfig` sub-message snapshot (cpi, swap_xy, invert_x,
+  invert_y, force_awake, smart_algorithm, run/rest1/rest2 downshift ms,
+  rest1/2/3 sample ms, report_interval_min_ms) — implemented in Phase B.
+  `has_runtime_config` is set only when `pmw3610_get_runtime_config()`
+  succeeds (nanopb `has_<field>` requirement).
+- `ReadDiagnostics{device_index}` → SQUAL, shutter, pix min/avg/max.
+  Implemented in Phase B.
+- `ReadRegister{device_index, address}` / `WriteRegister{device_index,
+  address, value}` — debug/tuning path, bounds-checked (`address`/`value`
+  must fit a byte) and device_index-checked; errors carry the errno value in
+  the message text. Implemented in Phase B. **WriteRegister has no
+  additional validation beyond fitting in a byte** -- it is a raw register
+  write, documented as a debug facility in README.md.
+- `CaptureFrame{device_index, pixel_count, max_invalid_retries}` → captures
+  into a static buffer, returns `{frame_id, pixel_count, chunk_size,
+  complete, duration_ms}`. Implemented in Phase C, procedure replaced with
+  the official datasheet sequence in Phase D (request fields 4-6, the old
+  procedure knobs, reserved). `pixel_count` is clamped to
+  `CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE` (0 → driver default 484).
+  `frame_id` is a monotonically increasing counter (starts at 1); errors
+  (bad `device_index`, driver failure) produce an `ErrorResponse`, not a
+  crash, including with zero PMW3610 devices present (native_sim).
+- `GetFrameChunk{frame_id, offset}` → `{frame_id, offset, bytes data}` (chunk
+  ≤ 128 B, `.options` bounded, fixed `chunk_size` = 128). Implemented in
+  Phase C. Validates `frame_id` matches the current captured frame and
+  `offset < length`; the web app's one-shot "Capture Once" path drives the
+  chunk loop sequentially (not parallel). Rejects while a `SetFrameStream`
+  stream is active (Phase E).
+- `SetFrameStream{device_index, enable, pixel_count, max_invalid_retries}` →
+  `{streaming}`. Implemented in Phase E, replacing the original plan of
+  "streaming" being a client-side `CaptureFrame`+`GetFrameChunk` poll loop.
+  `enable=true` starts a `k_work_delayable` loop on the system workqueue
+  that repeatedly calls `pmw3610_capture_frame()` and raises one
+  `FrameStreamChunk` Notification per 128-byte chunk of every captured
+  frame; `enable=false` stops it (current in-flight capture, if any, still
+  finishes). Shares the static frame buffer/`frame_id` counter with
+  `CaptureFrame`/`GetFrameChunk`, so only one of streaming or a one-shot
+  capture can be active — `CaptureFrame` rejects while streaming is on.
+  A `zmk_studio_core_lock_state_changed` listener force-stops the loop when
+  Studio locks (notifications are not lock-gated at the transport level,
+  only the RPC call that starts/stops the stream is).
+- No 64-bit proto fields (nanopb + `CONFIG_ZMK_STUDIO` restriction).
+- Sub-messages require `has_<field> = true` on the firmware side.
+
+RPC buffer note: default `ZMK_STUDIO_RPC_TX_BUF_SIZE` is 64 — README, tester
+config, and `tests/studio/native_sim.conf` all raise it to 256 for chunked
+frame responses (a `BUILD_ASSERT` in `pmw3610_handler.c` enforces this at
+compile time), and `ZMK_STUDIO_RPC_RX_BUF_SIZE` to 128 for custom settings.
+
+## Web UI (web/)
+
+Template stack: React + vite + buf/ts-proto + `@cormoran/zmk-studio-react-hook`.
+Implemented in Phase C as four cards plus the connection card:
+
+- Connection card (from template, kept as-is).
+- `SensorInfo.tsx`: "Sensor" card (`GetInfo` on connect + refresh button,
+  device selector when more than one device) and "Diagnostics" card
+  (`ReadDiagnostics`, manual + 1s auto-refresh toggle).
+- `SettingsPanel.tsx`: generic custom-settings editor for subsystem
+  `cormoran__pmw3610`, talking to zmk-feature-custom-settings' *separate*
+  Studio RPC subsystem (`cormoran_custom_settings`) — list with
+  values/constraints, inline int32/bool/string edit, write with
+  memory/persist mode, save/discard/reset buttons, per-row unsaved
+  indicator. Deviation from the original plan: trimmed relative to
+  zmk-feature-custom-settings' own reference app (no free-form
+  subsystem/key filter UI, no JSON import/export panel, no array
+  push/pop) since this module's settings are all fixed-key scalars.
+- `FrameViewer.tsx`: size selector (19/20/21/22, default 22), device index
+  input, capture-once button (`CaptureFrame`+`GetFrameChunk`, unchanged),
+  start/stop streaming toggle, advanced collapsible (`max_invalid_retries`
+  -- Phase D removed the obsolete procedure knobs), canvas render
+  (grayscale, 12px/sensor-pixel, nearest-neighbor), complete/duration
+  display, invalid-byte-count warning, FPS counter, and a `locked` prop
+  (Phase E) that disables all controls. **Phase E deviation from the
+  original Phase C plan**: streaming was originally a client-side sequential
+  `CaptureFrame`+drain-`GetFrameChunk` loop; Phase E replaces it with
+  `SetFrameStream{enable:true}` + subscribing to `FrameStreamChunk` custom
+  notifications via `onNotification({type:"custom", subsystemIndex, ...})`,
+  matching the proto/firmware redesign above -- no more client poll loop.
+- `frame.ts`: pure functions (`assembleFrame`, `chunkOffsets`,
+  `pixelByteToGray`, `frameToRgba`, `isValidPixelByte`) extracted for unit
+  testing without a canvas/DOM dependency, plus (Phase E)
+  `createFrameAssembler(totalSize)` — an incremental assembler for a stream
+  of `(offset, data)` chunks arriving one notification at a time (as opposed
+  to `assembleFrame`'s one-shot "all chunks already collected" input),
+  returning `{addChunk, getBytes, bytesWritten}`; `addChunk` returns `true`
+  once every byte in range has been written at least once.
+- `useStudioLockState.ts` (Phase E): a small hook subscribing to
+  `onNotification({type:"core", ...})` for `zmk.core.LockState` changes,
+  used by `App.tsx` to show a "locked" banner and pass `locked` down to
+  `SettingsPanel`/`FrameViewer`; also exports `isUnlockRequiredError()`,
+  checking whether a thrown error is the ts-client's `MetaError` with
+  `condition === ErrorConditions.UNLOCK_REQUIRED` (`call_rpc()` throws this
+  directly, per `@zmkfirmware/zmk-studio-ts-client`'s `index.js`), used by
+  `FrameViewer`/callers to show a clearer message if a locked-out RPC call
+  fails before any lock notification was observed (e.g. immediately after
+  reconnecting to an already-locked device).
+- Proto vendoring: `web/buf.gen.yaml` lists a *second* `buf generate` input
+  directory, `web/proto/`, containing a vendored copy of
+  zmk-feature-custom-settings' `custom_settings.proto` (see the
+  provenance/re-sync comment at the top of that file for the pinned commit
+  and how to refresh it). This is **not** the repo-root `proto/` tree used by
+  the firmware-side nanopb glob in `CMakeLists.txt` — vendoring under
+  `web/proto/` instead avoids a conflicting second copy of the
+  `cormoran.zmk.custom_settings` package in firmware builds that include
+  both modules (e.g. `pmw3610_settings_rpc`).
+  Originally this pointed straight at
+  `../dependencies/zmk-feature-custom-settings/proto` (the west dependency
+  checkout) instead of vendoring, which worked locally but broke CI:
+  `web-ui.yml` builds `web/` standalone with plain `npm ci` and never runs
+  `west update`, so that path doesn't exist there
+  (`stat ../dependencies/zmk-feature-custom-settings/proto: no such file or
+  directory`). Vendoring fixes this at the cost of manual re-sync when the
+  dependency's proto changes.
+
+## Test config (tests/zmk-config)
+
+- board `xiao_ble//zmk`, shield `tester_xiao`, snippet `studio-rpc-usb-uart`.
+- Overlay (from zmk-keyboard-dya2 right-trackball, user's wiring):
+  - spi0 pinctrl: SCK = P0.05 (D5), MOSI = MISO = P1.13 (D8, 3-wire shared)
+  - CS = `&xiao_d 10`, IRQ = `&xiao_d 9` (active low, pull-up)
+  - `cormoran,pmw3610`, `spi-max-frequency = <2000000>`
+  - **Important**: tester_xiao's kscan uses `xiao_d 0..10`; the overlay must
+    `/delete-property/ input-gpios` and redefine with D0–D4 only to avoid
+    conflicts with D5/D8/D9/D10.
+  - `zmk,input-listener` node for the sensor. `CONFIG_ZMK_POINTING=y`.
+- **Burst read ON vs OFF**: two snippets, `tests/zmk-config/snippets/
+  pmw3610-trackball` (burst read ON -- no `disable-burst-read` property,
+  the normal/recommended mode) and `.../pmw3610-trackball-no-burst`
+  (`disable-burst-read` set). Burst read needs NCS (`cs-gpios`) held low
+  across the whole multi-byte transfer; since this overlay's `&spi0` always
+  configures `cs-gpios`, ON is fully usable and is what real deployments
+  should use. OFF only matters for wiring/boards where the SPI bus has no
+  controller-driven NCS at all -- provided here purely for build/motion
+  coverage of that code path (`pmw3610_report_data()`'s
+  `config->disable_burst_read` branch), via a dedicated
+  `pmw3610_plain_no_burst` build.yaml artifact (motion reporting is the only
+  thing burst mode affects; RPC/settings artifacts stay on the ON snippet).
+- build.yaml artifacts: `pmw3610_disabled` (module off), `pmw3610_plain`
+  (driver only, burst read ON), `pmw3610_plain_no_burst` (driver only, burst
+  read OFF), `pmw3610_rpc` (driver + custom RPC, no custom settings),
+  `pmw3610_settings_rpc` (driver + custom RPC + custom settings + custom
+  settings' own Studio RPC: `-DCONFIG_ZMK_STUDIO=y
+  -DCONFIG_ZMK_PMW3610_STUDIO_RPC=y -DCONFIG_ZMK_CUSTOM_SETTINGS=y
+  -DCONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC=y
+  -DCONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y`).
+- `tests/studio/native_sim.conf` additionally enables
+  `CONFIG_SETTINGS`/`CONFIG_ZMK_CUSTOM_SETTINGS`/
+  `CONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC`/`CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS`
+  with zero PMW3610 devices present, proving the settings module compiles
+  and boots without crashing (both `cormoran__pmw3610` and
+  `cormoran_custom_settings` subsystems print at boot;
+  `tests/studio/keycode_events.snapshot` asserts both lines).
+
+## Phase E: secured subsystem + notification-based frame streaming
+
+### Security
+
+The whole `cormoran__pmw3610` subsystem meta moves from
+`ZMK_STUDIO_RPC_HANDLER_UNSECURED` to `ZMK_STUDIO_RPC_HANDLER_SECURED`
+(`src/studio/pmw3610_handler.c`). Security is per-subsystem, not per-method
+(`zmk_rpc_custom_subsystem_meta` has one `security` field checked in
+`custom_subsystem.c`'s `call()`), so this secures every method including
+`GetInfo`/`ReadDiagnostics`, not just `WriteRegister` — an accepted trade-off
+given `WriteRegister` is an arbitrary sensor register write.
+
+Unlocking in this ZMK fork is **physical-key-only**: there is no RPC unlock
+request (`zmk.core.Request` only has `getDeviceInfo`/`getLockState`/`lock`/
+`resetSettings`). A `&studio_unlock` behavior binding calls
+`zmk_studio_core_unlock()` directly on key press
+(`behavior_studio_unlock.c`). `CONFIG_ZMK_STUDIO_LOCKING` defaults on for any
+non-native_sim board (`imply ZMK_STUDIO_LOCKING if !ARCH_POSIX`), auto-locks
+after `CONFIG_ZMK_STUDIO_LOCK_IDLE_TIMEOUT_SEC` (default 600s) and on BLE
+disconnect. **Consequence for adopters**: any keyboard using this module must
+bind `&studio_unlock` somewhere in its keymap, or its web UI becomes
+permanently unusable once locked. `tests/zmk-config` gets a keymap override
+binding it (see below) since the shield's own keymap doesn't.
+
+Notifications (frame streaming) are **not** gated by lock state at the
+transport level (`custom_event_mapper` in `custom_subsystem.c` has no lock
+check, unlike `call()`) — only the RPC *call* that starts/stops streaming is
+secured. A locked client therefore cannot start a stream, but a stream
+started while unlocked would keep emitting notifications after a later
+auto-lock unless explicitly stopped. Mitigate by subscribing to
+`zmk_studio_core_lock_state_changed` and force-stopping any active stream
+when the state becomes `LOCKED`.
+
+### Frame streaming via notifications
+
+New proto messages (package `cormoran.pmw3610`):
+
+```proto
+message SetFrameStreamRequest {
+    uint32 device_index = 1;
+    bool enable = 2;
+    uint32 pixel_count = 3;         // 0 = driver default, same as CaptureFrameRequest
+    uint32 max_invalid_retries = 4; // 0 = driver default, same as CaptureFrameRequest
+}
+message SetFrameStreamResponse { bool streaming = 1; }
+
+message FrameStreamChunk {
+    uint32 frame_id = 1;
+    uint32 offset = 2;
+    bytes data = 3;      // <=128 bytes, same bound as GetFrameChunkResponse.data
+    uint32 total_size = 4; // repeated on every chunk so the client can detect the last one
+    bool complete = 5;     // sensor-reported completion (0x47 bit0), same value each chunk of a frame
+}
+
+message Notification {
+    oneof notification_type { FrameStreamChunk frame_stream_chunk = 1; }
+}
+```
+
+`SetFrameStreamRequest`/`Response` join the existing `Request`/`Response`
+oneofs (next free field numbers 7/8). `Notification` is a new top-level
+message, independent of `Request`/`Response`, exactly mirroring
+`zmk-feature-custom-settings`'s own `Notification` message — it is nanopb-
+encoded and carried as the opaque `payload` bytes inside `zmk.custom
+.CustomNotification`, itself found by resolving this subsystem's runtime
+index (`STRUCT_SECTION_GET`/`STRUCT_SECTION_COUNT` over
+`zmk_rpc_custom_subsystem`, exactly as
+`custom_subsystem_index_for_identifier()` does in
+`custom_settings_handler.c` — copy that pattern).
+
+Firmware: a `k_work_delayable` loop (system workqueue) that, while streaming
+is enabled, repeatedly calls the existing `pmw3610_capture_frame()` and, on
+success, raises one `FrameStreamChunk` notification per 128-byte chunk
+(`raise_zmk_studio_custom_notification`, synchronous per ZMK's event
+manager — matches the proven settings-notification pattern, no extra
+pacing needed a priori; add a small inter-chunk delay only if hardware
+testing shows transport overrun). `SetFrameStream` and `CaptureFrame`/
+`GetFrameChunk` share the same static frame buffer/frame_id counter, so
+concurrent use is disallowed: `CaptureFrame` returns an error while a stream
+is active; `SetFrameStream(enable=true)` validates `device_index` up front
+(same bounds check as other handlers) so an invalid target fails immediately
+instead of spinning.
+
+Given the sensor takes ~2s per 484-pixel frame (measured in Phase D) and
+frame capture inherently blocks normal cursor movement while it runs, "as
+fast as possible" back-to-back capture already self-paces streaming to
+~0.4-0.5 fps; document this in README as a hardware limitation, not a bug.
+
+### Validating a physical-unlock-only security model without a human present
+
+Phase D-style autonomous hardware validation cannot press a physical key, so
+it can only prove the **rejection** path (secured call while locked →
+`UNLOCK_REQUIRED`) against the real default build. To functionally validate
+the streaming mechanism end-to-end, use a validation-only build with
+`-DCONFIG_ZMK_STUDIO_LOCKING=n` (ad hoc `west build` cmake-arg, not committed
+to `build.yaml`) — mirrors the earlier `boot0` scratch-overlay approach for
+the same reason (environment can't do physical/human steps).
+
+## Validation plan (hardware)
+
+1. `python3 -m unittest` (build tests + native_sim unit tests).
+2. Flash `pmw3610_settings_rpc` via J-Link (`debug-zmk-jlink` skill;
+   nRF52840_xxAA).
+3. `tools/zmk-studio-rpc … info / custom-list` → both subsystems visible.
+4. Custom settings RPC: list, change `cpi`, verify sensor register (via
+   ReadRegister 0x85 RES_STEP under SPI page) and persistence across reboot.
+   Verify a setting change over RPC while the device is idle/active reaches
+   hardware promptly (change listener path), and that a value changed while
+   the sensor is mid-init (before `data->ready`) is still correctly applied
+   once init completes.
+5. Exercise `ReadDiagnostics`/`ReadRegister`/`WriteRegister` against a real
+   device (index bounds, register 0x85 RES_STEP round trip, error path for
+   an out-of-range device_index).
+6. `CaptureFrame` + `GetFrameChunk` (primary Phase D task -- done) →
+   Phase D found the Phase C guessed procedure never asserts PG_Valid;
+   replaced with the official datasheet (R2.4) Pixel_Grab sequence (see
+   "Frame capture" above) and validated on hardware: assembled frames,
+   checked `complete`/PG_Valid, confirmed the 484 = 22x22 array size
+   (datasheet Figure 17). Example CLI JSON request/response shapes are in
+   README.md's "Frame capture" section.
+7. Web UI smoke test (vite dev + Chrome WebSerial) if environment allows;
+   otherwise CLI-driven equivalent via `custom-call`. In particular verify
+   the Frame Viewer's streaming loop against real RPC round-trip latency
+   (the web-side "streaming" is a sequential capture loop with no fixed
+   interval, so FPS is bounded entirely by hardware/RPC speed, not
+   simulated in any test so far).

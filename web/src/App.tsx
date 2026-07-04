@@ -1,31 +1,56 @@
-import { useContext, useState } from "react";
 import "./App.css";
 import { connect as serial_connect } from "@zmkfirmware/zmk-studio-ts-client/transport/serial";
-import {
-  ZMKConnection,
-  ZMKCustomSubsystem,
-  ZMKAppContext,
-} from "@cormoran/zmk-studio-react-hook";
-import { Request, Response } from "./proto/your-name/template/template";
+import { ZMKConnection } from "@cormoran/zmk-studio-react-hook";
+import { SensorInfo } from "./SensorInfo";
+import { SettingsPanel } from "./SettingsPanel";
+import { FrameViewer } from "./FrameViewer";
+import { useStudioLockState } from "./useStudioLockState";
 
-export const SUBSYSTEM_IDENTIFIER = "your_name__template";
+function ConnectedContent({ deviceName }: { deviceName: string | undefined }) {
+  // Requires ZMKAppContext, which ZMKConnection's renderConnected subtree
+  // provides -- see useStudioLockState's implementation.
+  const { locked } = useStudioLockState();
+
+  return (
+    <>
+      <section className="card">
+        <h2>Device Connection</h2>
+        <div className="device-info">
+          <h3>Connected to: {deviceName}</h3>
+        </div>
+      </section>
+
+      {locked && (
+        <div className="locked-banner" role="alert">
+          ZMK Studio is locked — press the Studio unlock key on your keyboard to
+          use this module. Sensor settings and frame capture are disabled until
+          unlocked.
+        </div>
+      )}
+
+      <SensorInfo />
+      <SettingsPanel locked={locked} />
+      <FrameViewer locked={locked} />
+    </>
+  );
+}
 
 function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>🔧 ZMK Module Template</h1>
-        <p>Custom Studio RPC Demo</p>
+        <h1>PMW3610 Trackball</h1>
+        <p>Sensor configurator &amp; frame viewer (custom Studio RPC)</p>
       </header>
 
       <ZMKConnection
         renderDisconnected={({ connect, isLoading, error }) => (
           <section className="card">
             <h2>Device Connection</h2>
-            {isLoading && <p>⏳ Connecting...</p>}
+            {isLoading && <p>Connecting...</p>}
             {error && (
               <div className="error-message">
-                <p>🚨 {error}</p>
+                <p>{error}</p>
               </div>
             )}
             {!isLoading && (
@@ -33,131 +58,30 @@ function App() {
                 className="btn btn-primary"
                 onClick={() => connect(serial_connect)}
               >
-                🔌 Connect Serial
+                Connect Serial
               </button>
             )}
           </section>
         )}
         renderConnected={({ disconnect, deviceName }) => (
           <>
+            <ConnectedContent deviceName={deviceName} />
             <section className="card">
-              <h2>Device Connection</h2>
-              <div className="device-info">
-                <h3>✅ Connected to: {deviceName}</h3>
-              </div>
               <button className="btn btn-secondary" onClick={disconnect}>
                 Disconnect
               </button>
             </section>
-
-            <RPCTestSection />
           </>
         )}
       />
 
       <footer className="app-footer">
         <p>
-          <strong>Template Module</strong> - Customize this for your ZMK module
+          <strong>PMW3610 Module</strong> - sensor settings and frame capture
+          over custom Studio RPC
         </p>
       </footer>
     </div>
-  );
-}
-
-export function RPCTestSection() {
-  const zmkApp = useContext(ZMKAppContext);
-  const [inputValue, setInputValue] = useState<number>(42);
-  const [response, setResponse] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-
-  if (!zmkApp) return null;
-
-  const subsystem = zmkApp.findSubsystem(SUBSYSTEM_IDENTIFIER);
-
-  const sendSampleRequest = async () => {
-    if (!zmkApp.state.connection || !subsystem) return;
-
-    setIsLoading(true);
-    setResponse(null);
-
-    try {
-      const service = new ZMKCustomSubsystem(
-        zmkApp.state.connection,
-        subsystem.index
-      );
-
-      const request = Request.create({
-        sample: {
-          value: inputValue,
-        },
-      });
-
-      const payload = Request.encode(request).finish();
-      const responsePayload = await service.callRPC(payload);
-
-      if (responsePayload) {
-        const resp = Response.decode(responsePayload);
-        console.log("Decoded response:", resp);
-
-        if (resp.sample) {
-          setResponse(resp.sample.value);
-        } else if (resp.error) {
-          setResponse(`Error: ${resp.error.message}`);
-        }
-      }
-    } catch (error) {
-      console.error("RPC call failed:", error);
-      setResponse(
-        `Failed: ${error instanceof Error ? error.message : "Unknown error"}`
-      );
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  if (!subsystem) {
-    return (
-      <section className="card">
-        <div className="warning-message">
-          <p>
-            ⚠️ Subsystem "{SUBSYSTEM_IDENTIFIER}" not found. Make sure your
-            firmware includes the template module.
-          </p>
-        </div>
-      </section>
-    );
-  }
-
-  return (
-    <section className="card">
-      <h2>RPC Test</h2>
-      <p>Send a sample request to the firmware:</p>
-
-      <div className="input-group">
-        <label htmlFor="value-input">Value:</label>
-        <input
-          id="value-input"
-          type="number"
-          value={inputValue}
-          onChange={(e) => setInputValue(parseInt(e.target.value) || 0)}
-        />
-      </div>
-
-      <button
-        className="btn btn-primary"
-        disabled={isLoading}
-        onClick={sendSampleRequest}
-      >
-        {isLoading ? "⏳ Sending..." : "📤 Send Request"}
-      </button>
-
-      {response && (
-        <div className="response-box">
-          <h3>Response from Firmware:</h3>
-          <pre>{response}</pre>
-        </div>
-      )}
-    </section>
   );
 }
 
