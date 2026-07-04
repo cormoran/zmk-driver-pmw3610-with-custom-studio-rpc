@@ -13,34 +13,78 @@ devicetree compatible `cormoran,pmw3610`) — do not use both modules together.
 
 See [DESIGN.md](./DESIGN.md) for the full module design and roadmap.
 
+## Security — read this before adopting the module
+
+**The entire `cormoran__pmw3610` Studio RPC subsystem is SECURED.** ZMK
+Studio must be *unlocked* before any of this subsystem's RPCs succeed —
+including read-only ones like `GetInfo`/`ReadDiagnostics`. This is not
+configurable per-method: ZMK's custom-subsystem RPC dispatch checks lock
+state once per subsystem, not per request, and `WriteRegister` (an
+unvalidated raw sensor register write) is reason enough to secure the whole
+thing rather than leave it open by default.
+
+Two important consequences for anyone adding this module to a keyboard:
+
+1. **Unlocking is physical-key-only in this ZMK fork.** There is no RPC or
+   PIN-based unlock (`zmk.core.Request` only exposes `getDeviceInfo` /
+   `getLockState` / `lock` / `resetSettings` — no `unlock`). A
+   `&studio_unlock` behavior binding calls `zmk_studio_core_unlock()`
+   directly when pressed
+   (`dependencies/zmk/app/src/behaviors/behavior_studio_unlock.c`). **Your
+   keyboard's keymap MUST bind `&studio_unlock` somewhere**, or once Studio
+   locks there is no way to use this module's RPCs (including the web UI)
+   again without reflashing a keymap that has the binding. See
+   `tests/zmk-config/config/tester_xiao.keymap` for an example override.
+2. **Studio auto-locks.** By default (`CONFIG_ZMK_STUDIO_LOCKING`, on for
+   any non-`native_sim` board) it locks after
+   `CONFIG_ZMK_STUDIO_LOCK_IDLE_TIMEOUT_SEC` (default 600s) of RPC idleness
+   and whenever BLE disconnects
+   (`CONFIG_ZMK_STUDIO_LOCK_ON_DISCONNECT`). If the web UI suddenly shows a
+   "locked" banner and stops working, this is why — press the keyboard's
+   `&studio_unlock` key and it resumes automatically.
+
+Frame-streaming *notifications* (see "Frame capture" below) are not
+gated by lock state at the transport level, only the RPC call that
+starts/stops a stream is secured — a stream already running keeps emitting
+notifications through a later auto-lock unless something stops it, so the
+firmware itself force-stops any active stream when Studio locks.
+
 ## Summary
 
-This module currently includes (Phase A + Phase B + Phase C):
+This module currently includes (Phase A through Phase E):
 
 - **Firmware**: PMW3610 sensor driver (`src/pmw3610.c`) with a
   runtime-configurable parameter set (cpi, axis flags, force-awake, smart
   algorithm, downshift/sample times, minimum report interval — see
-  `include/cormoran/pmw3610/pmw3610_api.h`), a custom Studio RPC handler
-  (`src/studio/pmw3610_handler.c`) exposing sensor info/diagnostics/raw
-  register access/frame capture, and an optional settings integration
-  (`src/settings/pmw3610_settings.c`) via
+  `include/cormoran/pmw3610/pmw3610_api.h`), a **secured** custom Studio RPC
+  handler (`src/studio/pmw3610_handler.c`) exposing sensor info/diagnostics/
+  raw register access/frame capture/frame streaming, and an optional
+  settings integration (`src/settings/pmw3610_settings.c`) via
   [zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings).
 - **Protocol**: Protobuf definition (`proto/cormoran/pmw3610/pmw3610.proto`) —
   `GetInfo` (per-device info + runtime config snapshot), `ReadDiagnostics`,
-  `ReadRegister`/`WriteRegister`, `CaptureFrame`/`GetFrameChunk`.
+  `ReadRegister`/`WriteRegister`, `CaptureFrame`/`GetFrameChunk`,
+  `SetFrameStream` (notification-based streaming) plus a `Notification`
+  message carrying `FrameStreamChunk`.
 - **Web UI**: React + TypeScript app (`web/`) using
   [@cormoran/zmk-studio-react-hook](https://github.com/cormoran/react-zmk-studio) —
   sensor info/diagnostics cards, a generic settings editor (talking to
-  zmk-feature-custom-settings' own Studio RPC subsystem), and a frame
-  viewer (capture-once / streaming, canvas rendering, FPS counter).
+  zmk-feature-custom-settings' own Studio RPC subsystem), a frame viewer
+  (capture-once / notification-based streaming, canvas rendering, FPS
+  counter), and a Studio lock-state banner that disables controls while
+  locked.
 - **Tests**: Firmware unit tests (`tests/studio/`), build tests
   (`tests/zmk-config/`, including a `pmw3610_settings_rpc` artifact that
   builds with custom settings enabled), and web unit tests (`web/test/`,
-  including pure-function tests for frame chunk reassembly).
+  including pure-function tests for frame chunk reassembly/streaming
+  assembly).
 
-Phase D (hardware validation) is complete: the frame-capture procedure now
+Phase D (hardware validation) is complete: the frame-capture procedure
 follows the official PMW3610 datasheet (R2.4) `Pixel_Grab` sequence and has
-been validated against a real sensor (see "Frame capture" below).
+been validated against a real sensor (see "Frame capture" below). Phase E
+secures the whole subsystem and replaces the web UI's client-driven
+streaming loop with firmware-pushed notifications (see "Security" above and
+"Frame capture" below).
 
 ## More Info
 
@@ -198,11 +242,44 @@ array is 22x22 = 484 pixels (datasheet Figure 17).
   in one `CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE` (256 in this module's test
   config) — a `BUILD_ASSERT` in `src/studio/pmw3610_handler.c` catches a
   too-small value at compile time.
-- The web UI's "streaming" mode is a sequential capture loop (`CaptureFrame`
-  → drain `GetFrameChunk` → render → repeat), not a fixed-interval timer —
-  see [web/README.md](./web/README.md#frame-viewer-notes).
+- `CaptureFrame` rejects with an `ErrorResponse` ("frame streaming is
+  active...") if a `SetFrameStream` stream is currently running — stop the
+  stream first (see below).
 
-Example raw request/response JSON shapes for CLI tools (e.g.
+#### Frame streaming (`SetFrameStream` + `FrameStreamChunk` notification)
+
+Instead of a client-driven poll loop, the firmware can push captured frames
+on its own:
+
+- `SetFrameStream{device_index, enable, pixel_count, max_invalid_retries}` →
+  `{streaming}`. `enable = true` starts a background loop (system
+  workqueue) that repeatedly calls the same capture procedure as
+  `CaptureFrame` and, on each successful capture, raises one
+  `FrameStreamChunk` **notification** (not a response) per 128-byte chunk —
+  `{frame_id, offset, bytes data, total_size, complete}`, where `total_size`
+  and `complete` are repeated on every chunk of a frame so the client can
+  detect the last chunk without a separate "done" message. `enable = false`
+  stops the loop (the in-flight capture, if any, still finishes first).
+  `pixel_count`/`max_invalid_retries` follow the same 0-means-default,
+  clamped semantics as `CaptureFrame`.
+- `SetFrameStream` and `CaptureFrame`/`GetFrameChunk` share the same
+  firmware-side static buffer/`frame_id` counter, so only one can be active
+  — enabling streaming while a one-shot capture is somehow still in
+  progress is not possible (`CaptureFrame` is synchronous), and
+  `CaptureFrame` rejects while streaming is on (see above).
+- Because a 484-pixel `Pixel_Grab` capture takes roughly 2 seconds on real
+  hardware (measured in Phase D), the loop's "as fast as possible" pacing
+  naturally lands around 0.4-0.5 fps — this is a hardware limitation of the
+  sensor's Pixel_Grab procedure, not a bug or artificial throttle.
+- If Studio locks while a stream is running, the firmware stops it after
+  the current in-flight capture (a listener on the core lock-state event
+  sets the internal "streaming active" flag to false) — see "Security"
+  above. Notifications themselves are not lock-gated at the transport
+  level, only the `SetFrameStream` call that starts/stops a stream is.
+- The web UI's frame viewer uses this instead of a client poll loop — see
+  [web/README.md](./web/README.md#frame-viewer-notes).
+
+Example raw request/response/notification JSON shapes for CLI tools (e.g.
 `tools/zmk-studio-rpc custom-call`) — see `proto/cormoran/pmw3610/pmw3610.proto`
 for the exact field numbers:
 
@@ -215,6 +292,17 @@ for the exact field numbers:
 // GetFrameChunk request (repeat with offset 0, 128, 256, 384)
 { "getFrameChunk": { "frameId": 1, "offset": 0 } }
 // -> { "getFrameChunk": { "frameId": 1, "offset": 0, "data": "<128 bytes base64>" } }
+
+// SetFrameStream request (start)
+{ "setFrameStream": { "deviceIndex": 0, "enable": true, "pixelCount": 484 } }
+// -> { "setFrameStream": { "streaming": true } }
+// ... followed by repeated notifications, e.g.:
+// { "frameStreamChunk": { "frameId": 1, "offset": 0, "data": "<128 bytes base64>",
+//     "totalSize": 484, "complete": true } }
+
+// SetFrameStream request (stop)
+{ "setFrameStream": { "deviceIndex": 0, "enable": false } }
+// -> { "setFrameStream": { "streaming": false } }
 ```
 
 ### RPC debug facilities
@@ -223,10 +311,10 @@ The `WriteRegister` RPC call writes an arbitrary sensor register with no
 validation beyond fitting in a byte. It is a debug/tuning facility (e.g. for
 exploring the frame-capture procedure above interactively), but it can just
 as easily put the sensor in a bad state until the next power-up reset /
-reconfigure. The subsystem is unsecured (matching this module's template
-default) — treat access to it like access to a debug/JTAG interface: fine
-for your own trusted host, not something to expose over an untrusted
-transport.
+reconfigure. As of Phase E the whole subsystem (including `WriteRegister`)
+requires ZMK Studio to be unlocked — see "Security" above — but treat access
+to it like access to a debug/JTAG interface regardless: fine for your own
+trusted host, not something to expose over an untrusted transport.
 
 ### Web UI
 

@@ -276,10 +276,13 @@ tuning; only `pixel_count` and `max_invalid_retries` remain.
 
 ```proto
 Request  = oneof { GetInfoRequest, ReadDiagnosticsRequest, CaptureFrameRequest,
-                   GetFrameChunkRequest, ReadRegisterRequest, WriteRegisterRequest }
+                   GetFrameChunkRequest, ReadRegisterRequest, WriteRegisterRequest,
+                   SetFrameStreamRequest }
 Response = oneof { ErrorResponse, GetInfoResponse, ReadDiagnosticsResponse,
                    CaptureFrameResponse, GetFrameChunkResponse,
-                   ReadRegisterResponse, WriteRegisterResponse }
+                   ReadRegisterResponse, WriteRegisterResponse,
+                   SetFrameStreamResponse }
+Notification = oneof { FrameStreamChunk } // top-level message, Phase E
 ```
 
 - `GetInfo` → per-device: ready flag, product id, revision id, init error,
@@ -308,9 +311,22 @@ Response = oneof { ErrorResponse, GetInfoResponse, ReadDiagnosticsResponse,
 - `GetFrameChunk{frame_id, offset}` → `{frame_id, offset, bytes data}` (chunk
   ≤ 128 B, `.options` bounded, fixed `chunk_size` = 128). Implemented in
   Phase C. Validates `frame_id` matches the current captured frame and
-  `offset < length`; the web app drives the chunk loop sequentially (not
-  parallel) and "streaming" = repeated `CaptureFrame` + drain-`GetFrameChunk`
-  cycles, not a separate continuous-streaming RPC verb.
+  `offset < length`; the web app's one-shot "Capture Once" path drives the
+  chunk loop sequentially (not parallel). Rejects while a `SetFrameStream`
+  stream is active (Phase E).
+- `SetFrameStream{device_index, enable, pixel_count, max_invalid_retries}` →
+  `{streaming}`. Implemented in Phase E, replacing the original plan of
+  "streaming" being a client-side `CaptureFrame`+`GetFrameChunk` poll loop.
+  `enable=true` starts a `k_work_delayable` loop on the system workqueue
+  that repeatedly calls `pmw3610_capture_frame()` and raises one
+  `FrameStreamChunk` Notification per 128-byte chunk of every captured
+  frame; `enable=false` stops it (current in-flight capture, if any, still
+  finishes). Shares the static frame buffer/`frame_id` counter with
+  `CaptureFrame`/`GetFrameChunk`, so only one of streaming or a one-shot
+  capture can be active — `CaptureFrame` rejects while streaming is on.
+  A `zmk_studio_core_lock_state_changed` listener force-stops the loop when
+  Studio locks (notifications are not lock-gated at the transport level,
+  only the RPC call that starts/stops the stream is).
 - No 64-bit proto fields (nanopb + `CONFIG_ZMK_STUDIO` restriction).
 - Sub-messages require `has_<field> = true` on the firmware side.
 
@@ -338,14 +354,35 @@ Implemented in Phase C as four cards plus the connection card:
   subsystem/key filter UI, no JSON import/export panel, no array
   push/pop) since this module's settings are all fixed-key scalars.
 - `FrameViewer.tsx`: size selector (19/20/21/22, default 22), device index
-  input, capture-once button, start/stop streaming toggle (sequential
-  capture loop, not a fixed-interval timer), advanced collapsible
-  (`max_invalid_retries` -- Phase D removed the obsolete procedure knobs),
-  canvas render (grayscale, 12px/sensor-pixel, nearest-neighbor),
-  complete/duration display, invalid-byte-count warning, FPS counter.
+  input, capture-once button (`CaptureFrame`+`GetFrameChunk`, unchanged),
+  start/stop streaming toggle, advanced collapsible (`max_invalid_retries`
+  -- Phase D removed the obsolete procedure knobs), canvas render
+  (grayscale, 12px/sensor-pixel, nearest-neighbor), complete/duration
+  display, invalid-byte-count warning, FPS counter, and a `locked` prop
+  (Phase E) that disables all controls. **Phase E deviation from the
+  original Phase C plan**: streaming was originally a client-side sequential
+  `CaptureFrame`+drain-`GetFrameChunk` loop; Phase E replaces it with
+  `SetFrameStream{enable:true}` + subscribing to `FrameStreamChunk` custom
+  notifications via `onNotification({type:"custom", subsystemIndex, ...})`,
+  matching the proto/firmware redesign above -- no more client poll loop.
 - `frame.ts`: pure functions (`assembleFrame`, `chunkOffsets`,
   `pixelByteToGray`, `frameToRgba`, `isValidPixelByte`) extracted for unit
-  testing without a canvas/DOM dependency.
+  testing without a canvas/DOM dependency, plus (Phase E)
+  `createFrameAssembler(totalSize)` — an incremental assembler for a stream
+  of `(offset, data)` chunks arriving one notification at a time (as opposed
+  to `assembleFrame`'s one-shot "all chunks already collected" input),
+  returning `{addChunk, getBytes, bytesWritten}`; `addChunk` returns `true`
+  once every byte in range has been written at least once.
+- `useStudioLockState.ts` (Phase E): a small hook subscribing to
+  `onNotification({type:"core", ...})` for `zmk.core.LockState` changes,
+  used by `App.tsx` to show a "locked" banner and pass `locked` down to
+  `SettingsPanel`/`FrameViewer`; also exports `isUnlockRequiredError()`,
+  checking whether a thrown error is the ts-client's `MetaError` with
+  `condition === ErrorConditions.UNLOCK_REQUIRED` (`call_rpc()` throws this
+  directly, per `@zmkfirmware/zmk-studio-ts-client`'s `index.js`), used by
+  `FrameViewer`/callers to show a clearer message if a locked-out RPC call
+  fails before any lock notification was observed (e.g. immediately after
+  reconnecting to an already-locked device).
 - Proto vendoring: `web/buf.gen.yaml` lists a *second* `buf generate` input
   directory pointing directly at
   `../dependencies/zmk-feature-custom-settings/proto` (not vendored into
@@ -379,6 +416,104 @@ Implemented in Phase C as four cards plus the connection card:
   and boots without crashing (both `cormoran__pmw3610` and
   `cormoran_custom_settings` subsystems print at boot;
   `tests/studio/keycode_events.snapshot` asserts both lines).
+
+## Phase E: secured subsystem + notification-based frame streaming
+
+### Security
+
+The whole `cormoran__pmw3610` subsystem meta moves from
+`ZMK_STUDIO_RPC_HANDLER_UNSECURED` to `ZMK_STUDIO_RPC_HANDLER_SECURED`
+(`src/studio/pmw3610_handler.c`). Security is per-subsystem, not per-method
+(`zmk_rpc_custom_subsystem_meta` has one `security` field checked in
+`custom_subsystem.c`'s `call()`), so this secures every method including
+`GetInfo`/`ReadDiagnostics`, not just `WriteRegister` — an accepted trade-off
+given `WriteRegister` is an arbitrary sensor register write.
+
+Unlocking in this ZMK fork is **physical-key-only**: there is no RPC unlock
+request (`zmk.core.Request` only has `getDeviceInfo`/`getLockState`/`lock`/
+`resetSettings`). A `&studio_unlock` behavior binding calls
+`zmk_studio_core_unlock()` directly on key press
+(`behavior_studio_unlock.c`). `CONFIG_ZMK_STUDIO_LOCKING` defaults on for any
+non-native_sim board (`imply ZMK_STUDIO_LOCKING if !ARCH_POSIX`), auto-locks
+after `CONFIG_ZMK_STUDIO_LOCK_IDLE_TIMEOUT_SEC` (default 600s) and on BLE
+disconnect. **Consequence for adopters**: any keyboard using this module must
+bind `&studio_unlock` somewhere in its keymap, or its web UI becomes
+permanently unusable once locked. `tests/zmk-config` gets a keymap override
+binding it (see below) since the shield's own keymap doesn't.
+
+Notifications (frame streaming) are **not** gated by lock state at the
+transport level (`custom_event_mapper` in `custom_subsystem.c` has no lock
+check, unlike `call()`) — only the RPC *call* that starts/stops streaming is
+secured. A locked client therefore cannot start a stream, but a stream
+started while unlocked would keep emitting notifications after a later
+auto-lock unless explicitly stopped. Mitigate by subscribing to
+`zmk_studio_core_lock_state_changed` and force-stopping any active stream
+when the state becomes `LOCKED`.
+
+### Frame streaming via notifications
+
+New proto messages (package `cormoran.pmw3610`):
+
+```proto
+message SetFrameStreamRequest {
+    uint32 device_index = 1;
+    bool enable = 2;
+    uint32 pixel_count = 3;         // 0 = driver default, same as CaptureFrameRequest
+    uint32 max_invalid_retries = 4; // 0 = driver default, same as CaptureFrameRequest
+}
+message SetFrameStreamResponse { bool streaming = 1; }
+
+message FrameStreamChunk {
+    uint32 frame_id = 1;
+    uint32 offset = 2;
+    bytes data = 3;      // <=128 bytes, same bound as GetFrameChunkResponse.data
+    uint32 total_size = 4; // repeated on every chunk so the client can detect the last one
+    bool complete = 5;     // sensor-reported completion (0x47 bit0), same value each chunk of a frame
+}
+
+message Notification {
+    oneof notification_type { FrameStreamChunk frame_stream_chunk = 1; }
+}
+```
+
+`SetFrameStreamRequest`/`Response` join the existing `Request`/`Response`
+oneofs (next free field numbers 7/8). `Notification` is a new top-level
+message, independent of `Request`/`Response`, exactly mirroring
+`zmk-feature-custom-settings`'s own `Notification` message — it is nanopb-
+encoded and carried as the opaque `payload` bytes inside `zmk.custom
+.CustomNotification`, itself found by resolving this subsystem's runtime
+index (`STRUCT_SECTION_GET`/`STRUCT_SECTION_COUNT` over
+`zmk_rpc_custom_subsystem`, exactly as
+`custom_subsystem_index_for_identifier()` does in
+`custom_settings_handler.c` — copy that pattern).
+
+Firmware: a `k_work_delayable` loop (system workqueue) that, while streaming
+is enabled, repeatedly calls the existing `pmw3610_capture_frame()` and, on
+success, raises one `FrameStreamChunk` notification per 128-byte chunk
+(`raise_zmk_studio_custom_notification`, synchronous per ZMK's event
+manager — matches the proven settings-notification pattern, no extra
+pacing needed a priori; add a small inter-chunk delay only if hardware
+testing shows transport overrun). `SetFrameStream` and `CaptureFrame`/
+`GetFrameChunk` share the same static frame buffer/frame_id counter, so
+concurrent use is disallowed: `CaptureFrame` returns an error while a stream
+is active; `SetFrameStream(enable=true)` validates `device_index` up front
+(same bounds check as other handlers) so an invalid target fails immediately
+instead of spinning.
+
+Given the sensor takes ~2s per 484-pixel frame (measured in Phase D) and
+frame capture inherently blocks normal cursor movement while it runs, "as
+fast as possible" back-to-back capture already self-paces streaming to
+~0.4-0.5 fps; document this in README as a hardware limitation, not a bug.
+
+### Validating a physical-unlock-only security model without a human present
+
+Phase D-style autonomous hardware validation cannot press a physical key, so
+it can only prove the **rejection** path (secured call while locked →
+`UNLOCK_REQUIRED`) against the real default build. To functionally validate
+the streaming mechanism end-to-end, use a validation-only build with
+`-DCONFIG_ZMK_STUDIO_LOCKING=n` (ad hoc `west build` cmake-arg, not committed
+to `build.yaml`) — mirrors the earlier `boot0` scratch-overlay approach for
+the same reason (environment can't do physical/human steps).
 
 ## Validation plan (hardware)
 

@@ -129,6 +129,15 @@
   color: #b42318;
 }
 
+.locked-banner {
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.5rem;
+  border: 1px solid #f0c36d;
+  background: #fff8e6;
+  border-radius: 4px;
+  font-weight: 600;
+}
+
 .setting-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));

@@ -3,20 +3,25 @@ import {
   ZMKCustomSubsystem,
   ZMKAppContext,
 } from "@cormoran/zmk-studio-react-hook";
-import { Request, Response } from "./proto/cormoran/pmw3610/pmw3610";
+import {
+  Notification as PMW3610Notification,
+  Request,
+  Response,
+} from "./proto/cormoran/pmw3610/pmw3610";
 import {
   assembleFrame,
   chunkOffsets,
+  createFrameAssembler,
   frameToRgba,
   type FrameChunk,
 } from "./frame";
+import { isUnlockRequiredError } from "./useStudioLockState";
 
 export const PMW3610_SUBSYSTEM_IDENTIFIER = "cormoran__pmw3610";
 
 const SIDE_OPTIONS = [19, 20, 21, 22];
 const DEFAULT_SIDE = 22;
 const PIXEL_SCALE = 12; // px per sensor pixel on <canvas>
-const STREAM_LOOP_DELAY_MS = 10; // small yield between captures while streaming
 
 interface AdvancedOptions {
   maxInvalidRetries: string;
@@ -26,7 +31,16 @@ const DEFAULT_ADVANCED: AdvancedOptions = {
   maxInvalidRetries: "",
 };
 
-export function FrameViewer() {
+export interface FrameViewerProps {
+  /** True while ZMK Studio is locked -- disables capture/streaming
+   * controls (the underlying RPC calls would fail with UNLOCK_REQUIRED
+   * anyway). Any active stream is stopped firmware-side automatically on
+   * lock (see src/studio/pmw3610_handler.c's lock listener), so the UI
+   * state is reset to match when this flips to true. */
+  locked?: boolean;
+}
+
+export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   const zmkApp = useContext(ZMKAppContext);
   const subsystem = zmkApp?.findSubsystem(PMW3610_SUBSYSTEM_IDENTIFIER);
 
@@ -44,9 +58,15 @@ export function FrameViewer() {
   const [error, setError] = useState<string | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const streamingRef = useRef(false);
   const frameCountRef = useRef(0);
   const fpsWindowStartRef = useRef(0);
+  const unsubscribeNotificationsRef = useRef<(() => void) | null>(null);
+  // Per-frame_id incremental assembler, keyed so a late chunk from a
+  // previous frame_id (should not happen, but notifications are
+  // best-effort/unordered in principle) cannot corrupt the current frame.
+  const assemblersRef = useRef(
+    new Map<number, ReturnType<typeof createFrameAssembler>>()
+  );
 
   const callRequest = async (request: Request): Promise<Response> => {
     const connection = zmkApp?.state.connection;
@@ -161,59 +181,167 @@ export function FrameViewer() {
     try {
       await captureOnce();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Unknown error");
+      if (isUnlockRequiredError(e)) {
+        setError(
+          "ZMK Studio is locked -- press the Studio unlock key on your keyboard."
+        );
+      } else {
+        setError(e instanceof Error ? e.message : "Unknown error");
+      }
     } finally {
       setIsCapturing(false);
     }
   };
 
-  const stopStreaming = () => {
-    streamingRef.current = false;
-    setIsStreaming(false);
+  // Notification-based streaming (Phase E): SetFrameStream{enable: true}
+  // starts a firmware-side capture loop that raises one FrameStreamChunk
+  // notification per 128-byte chunk of every captured frame, instead of
+  // this component polling CaptureFrame+GetFrameChunk in a loop.
+  const handleFrameStreamNotification = (payload: Uint8Array) => {
+    let notification: PMW3610Notification;
+    try {
+      notification = PMW3610Notification.decode(payload);
+    } catch {
+      return;
+    }
+    const chunk = notification.frameStreamChunk;
+    if (!chunk) return;
+
+    const assemblers = assemblersRef.current;
+    // A new frame_id means any previous (necessarily incomplete, or it
+    // would have been rendered and removed already) assembler for an
+    // older frame is stale -- drop it rather than let the map grow
+    // unbounded across a long streaming session.
+    for (const key of assemblers.keys()) {
+      if (key !== chunk.frameId) {
+        assemblers.delete(key);
+      }
+    }
+
+    let assembler = assemblers.get(chunk.frameId);
+    if (!assembler) {
+      assembler = createFrameAssembler(chunk.totalSize);
+      assemblers.set(chunk.frameId, assembler);
+    }
+
+    const isComplete = assembler.addChunk(chunk.offset, chunk.data);
+    if (!isComplete) {
+      return;
+    }
+    assemblers.delete(chunk.frameId);
+
+    const bytes = assembler.getBytes();
+    let invalidCount = 0;
+    for (const b of bytes) {
+      if ((b & 0x80) === 0) invalidCount++;
+    }
+
+    renderFrame(bytes, side);
+    setInvalidCount(invalidCount);
+    setPixelCount(chunk.totalSize);
+    setComplete(chunk.complete);
+    setDurationMs(null); // not reported per-frame while streaming
+
+    frameCountRef.current++;
+    const now = performance.now();
+    const elapsed = now - fpsWindowStartRef.current;
+    if (elapsed >= 1000) {
+      setFps((frameCountRef.current * 1000) / elapsed);
+      frameCountRef.current = 0;
+      fpsWindowStartRef.current = now;
+    }
   };
 
-  const startStreaming = () => {
-    if (streamingRef.current) return;
-    streamingRef.current = true;
-    setIsStreaming(true);
+  const setFrameStream = async (enable: boolean): Promise<boolean> => {
+    const resp = await callRequest(
+      Request.create({
+        setFrameStream: {
+          deviceIndex,
+          enable,
+          pixelCount: enable ? side * side : 0,
+          maxInvalidRetries: advanced.maxInvalidRetries
+            ? Number.parseInt(advanced.maxInvalidRetries, 10)
+            : 0,
+        },
+      })
+    );
+    if (resp.error) {
+      throw new Error(resp.error.message);
+    }
+    return resp.setFrameStream?.streaming ?? false;
+  };
+
+  const stopStreaming = async () => {
+    setIsStreaming(false);
+    unsubscribeNotificationsRef.current?.();
+    unsubscribeNotificationsRef.current = null;
+    try {
+      await setFrameStream(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    }
+  };
+
+  const startStreaming = async () => {
+    if (isStreaming || !zmkApp || !subsystem) return;
     setError(null);
+    assemblersRef.current.clear();
     frameCountRef.current = 0;
     fpsWindowStartRef.current = performance.now();
+    setFps(null);
 
-    const loop = async () => {
-      while (streamingRef.current) {
-        try {
-          await captureOnce();
-          frameCountRef.current++;
-          const now = performance.now();
-          const elapsed = now - fpsWindowStartRef.current;
-          if (elapsed >= 1000) {
-            setFps((frameCountRef.current * 1000) / elapsed);
-            frameCountRef.current = 0;
-            fpsWindowStartRef.current = now;
-          }
-        } catch (e) {
-          setError(e instanceof Error ? e.message : "Unknown error");
-          streamingRef.current = false;
-          setIsStreaming(false);
-          break;
-        }
-        // Yield briefly so the UI thread / other RPC users aren't starved;
-        // "streaming" here is a sequential capture loop, not a fixed-rate
-        // timer.
-        await new Promise((resolve) =>
-          setTimeout(resolve, STREAM_LOOP_DELAY_MS)
-        );
+    try {
+      unsubscribeNotificationsRef.current = zmkApp.onNotification({
+        type: "custom",
+        subsystemIndex: subsystem.index,
+        callback: (notification) =>
+          handleFrameStreamNotification(notification.payload),
+      });
+      const streaming = await setFrameStream(true);
+      setIsStreaming(streaming);
+      if (!streaming) {
+        unsubscribeNotificationsRef.current?.();
+        unsubscribeNotificationsRef.current = null;
       }
-    };
-    void loop();
+    } catch (e) {
+      unsubscribeNotificationsRef.current?.();
+      unsubscribeNotificationsRef.current = null;
+      if (isUnlockRequiredError(e)) {
+        setError(
+          "ZMK Studio is locked -- press the Studio unlock key on your keyboard."
+        );
+      } else {
+        setError(e instanceof Error ? e.message : "Unknown error");
+      }
+    }
   };
 
   useEffect(() => {
     return () => {
-      streamingRef.current = false;
+      unsubscribeNotificationsRef.current?.();
     };
   }, []);
+
+  // If Studio locks while streaming, the firmware stops the stream loop on
+  // its own (see the lock listener in pmw3610_handler.c) -- but it does not
+  // (and cannot, notifications aren't request/response) tell the client
+  // it did so. Reset the UI's streaming state to match so the "Start
+  // Streaming" button becomes available again once unlocked, instead of
+  // staying stuck showing "Stop Streaming" for a stream that no longer
+  // exists.
+  useEffect(() => {
+    if (locked && isStreaming) {
+      unsubscribeNotificationsRef.current?.();
+      unsubscribeNotificationsRef.current = null;
+      // Reacting to an external system (the firmware silently stopping the
+      // stream on lock) becoming out of sync with local UI state, not a
+      // derived-state anti-pattern -- see the comment above.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setIsStreaming(false);
+    }
+    // Only react to the lock transition, not every isStreaming change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locked]);
 
   if (!zmkApp) return null;
 
@@ -247,7 +375,7 @@ export function FrameViewer() {
           id="side-select"
           value={side}
           onChange={(e) => setSide(Number(e.target.value))}
-          disabled={isStreaming}
+          disabled={isStreaming || locked}
         >
           {SIDE_OPTIONS.map((n) => (
             <option key={n} value={n}>
@@ -263,27 +391,30 @@ export function FrameViewer() {
           min={0}
           value={deviceIndex}
           onChange={(e) => setDeviceIndex(Number(e.target.value))}
-          disabled={isStreaming}
+          disabled={isStreaming || locked}
         />
       </div>
 
       <div className="toolbar">
         <button
           className="btn btn-primary"
-          disabled={isCapturing || isStreaming}
+          disabled={isCapturing || isStreaming || locked}
           onClick={() => void handleCaptureOnce()}
         >
           {isCapturing ? "Capturing..." : "Capture Once"}
         </button>
         {isStreaming ? (
-          <button className="btn btn-danger" onClick={stopStreaming}>
+          <button
+            className="btn btn-danger"
+            onClick={() => void stopStreaming()}
+          >
             Stop Streaming
           </button>
         ) : (
           <button
             className="btn"
-            disabled={isCapturing}
-            onClick={startStreaming}
+            disabled={isCapturing || locked}
+            onClick={() => void startStreaming()}
           >
             Start Streaming
           </button>
@@ -306,6 +437,7 @@ export function FrameViewer() {
             min={0}
             max={100}
             value={advanced.maxInvalidRetries}
+            disabled={isStreaming || locked}
             onChange={(e) =>
               setAdvanced({ ...advanced, maxInvalidRetries: e.target.value })
             }

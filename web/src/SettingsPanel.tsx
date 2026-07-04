@@ -36,7 +36,14 @@ const SOURCE_LOCAL = 0;
 
 type EditingValue = { key: string; text: string };
 
-export function SettingsPanel() {
+export interface SettingsPanelProps {
+  /** True while ZMK Studio is locked -- disables all write/refresh
+   * controls (the underlying RPC calls would fail with UNLOCK_REQUIRED
+   * anyway; this avoids surprising the user with an error per click). */
+  locked?: boolean;
+}
+
+export function SettingsPanel({ locked = false }: SettingsPanelProps = {}) {
   const zmkApp = useContext(ZMKAppContext);
   const [settings, setSettings] = useState<Setting[]>([]);
   const [editing, setEditing] = useState<EditingValue | null>(null);
@@ -305,7 +312,7 @@ export function SettingsPanel() {
       <div className="toolbar">
         <button
           className="btn"
-          disabled={isLoading}
+          disabled={isLoading || locked}
           onClick={() => void loadSettings()}
         >
           Refresh
@@ -316,6 +323,7 @@ export function SettingsPanel() {
         <select
           id="write-mode-select"
           value={writeMode}
+          disabled={locked}
           onChange={(e) => setWriteMode(Number(e.target.value))}
         >
           <option value={SettingWriteMode.SETTING_WRITE_MODE_MEMORY}>
@@ -327,21 +335,21 @@ export function SettingsPanel() {
         </select>
         <button
           className="btn"
-          disabled={isLoading}
+          disabled={isLoading || locked}
           onClick={() => void runScopeAction("saveSettings", "Save")}
         >
           Save
         </button>
         <button
           className="btn"
-          disabled={isLoading}
+          disabled={isLoading || locked}
           onClick={() => void runScopeAction("discardSettings", "Discard")}
         >
           Discard
         </button>
         <button
           className="btn btn-danger"
-          disabled={isLoading}
+          disabled={isLoading || locked}
           onClick={() => void runScopeAction("resetSettings", "Reset")}
         >
           Reset
@@ -369,6 +377,7 @@ export function SettingsPanel() {
                       <input
                         aria-label={`${setting.key} value`}
                         value={editing.text}
+                        disabled={locked}
                         onChange={(e) =>
                           setEditing({ key: setting.key, text: e.target.value })
                         }
@@ -384,7 +393,7 @@ export function SettingsPanel() {
                       <div className="toolbar">
                         <button
                           className="btn btn-primary"
-                          disabled={isLoading}
+                          disabled={isLoading || locked}
                           onClick={() => void writeSetting(setting)}
                         >
                           Write
@@ -400,7 +409,7 @@ export function SettingsPanel() {
                     ) : (
                       <button
                         className="btn"
-                        disabled={isLoading}
+                        disabled={isLoading || locked}
                         onClick={() => startEditing(setting)}
                       >
                         Edit

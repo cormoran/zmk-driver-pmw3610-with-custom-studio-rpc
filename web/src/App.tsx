@@ -4,6 +4,36 @@ import { ZMKConnection } from "@cormoran/zmk-studio-react-hook";
 import { SensorInfo } from "./SensorInfo";
 import { SettingsPanel } from "./SettingsPanel";
 import { FrameViewer } from "./FrameViewer";
+import { useStudioLockState } from "./useStudioLockState";
+
+function ConnectedContent({ deviceName }: { deviceName: string | undefined }) {
+  // Requires ZMKAppContext, which ZMKConnection's renderConnected subtree
+  // provides -- see useStudioLockState's implementation.
+  const { locked } = useStudioLockState();
+
+  return (
+    <>
+      <section className="card">
+        <h2>Device Connection</h2>
+        <div className="device-info">
+          <h3>Connected to: {deviceName}</h3>
+        </div>
+      </section>
+
+      {locked && (
+        <div className="locked-banner" role="alert">
+          ZMK Studio is locked — press the Studio unlock key on your keyboard to
+          use this module. Sensor settings and frame capture are disabled until
+          unlocked.
+        </div>
+      )}
+
+      <SensorInfo />
+      <SettingsPanel locked={locked} />
+      <FrameViewer locked={locked} />
+    </>
+  );
+}
 
 function App() {
   return (
@@ -35,19 +65,12 @@ function App() {
         )}
         renderConnected={({ disconnect, deviceName }) => (
           <>
+            <ConnectedContent deviceName={deviceName} />
             <section className="card">
-              <h2>Device Connection</h2>
-              <div className="device-info">
-                <h3>Connected to: {deviceName}</h3>
-              </div>
               <button className="btn btn-secondary" onClick={disconnect}>
                 Disconnect
               </button>
             </section>
-
-            <SensorInfo />
-            <SettingsPanel />
-            <FrameViewer />
           </>
         )}
       />

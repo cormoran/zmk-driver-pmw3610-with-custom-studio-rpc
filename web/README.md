@@ -14,12 +14,18 @@ PMW3610 ZMK module's custom Studio RPC subsystem.
   `cormoran_custom_settings` subsystem provided by
   [zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings)
   (list/edit/write with memory or persist mode, save/discard/reset)
-- **Frame viewer**: capture a still image from the sensor (`CaptureFrame` +
-  chunked `GetFrameChunk`) and render it to a `<canvas>`, with a
-  capture-once button, a streaming toggle (sequential capture loop, not a
-  fixed-interval timer), an FPS counter, an invalid-byte (PG_VALID clear)
-  warning count, and an advanced panel for tuning the (hardware-unvalidated
-  as of this writing) capture procedure
+- **Frame viewer**: capture a still image from the sensor using the official
+  PMW3610 datasheet `Pixel_Grab` procedure, and render it to a `<canvas>`.
+  A capture-once button pulls one frame via `CaptureFrame` + chunked
+  `GetFrameChunk`; a streaming toggle instead calls `SetFrameStream` and
+  subscribes to `FrameStreamChunk` custom Studio notifications pushed by the
+  firmware (no client-side polling loop) -- see "Frame viewer notes" below.
+  Also shows an FPS counter, an invalid-byte (PG_VALID clear) warning count,
+  and an advanced panel for the per-pixel retry budget.
+- **Studio lock awareness**: the `cormoran__pmw3610` subsystem is secured
+  (see the module README's "Security" section) -- the UI shows a banner and
+  disables settings/frame controls while ZMK Studio is locked, and reacts to
+  `UNLOCK_REQUIRED` RPC errors even if no lock notification was seen yet.
 - **React + TypeScript**: Modern web development with Vite for fast builds
 - **react-zmk-studio**: Uses the `@cormoran/zmk-studio-react-hook` library for
   simplified ZMK integration
@@ -162,24 +168,43 @@ render(
 
 - The firmware side has a fixed-size static frame buffer
   (`CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE`, default 484 = 22x22).
-  `CaptureFrame`'s `pixel_count` is clamped to this size.
-- `GetFrameChunk` returns up to 128 bytes per call; the web app loops
-  `GetFrameChunk` calls (see `chunkOffsets()` in `src/frame.ts`) until the
-  whole frame is collected.
-- "Streaming" is a sequential capture loop (capture, fetch all chunks,
-  render, repeat), not a fixed-interval timer -- actual frame rate depends
-  on RPC round-trip time and is shown by the FPS counter.
-- The capture procedure (PIXEL_GRAB/FRAME_GRAB register sequence) is not
-  documented in the public datasheet and is unvalidated against real
-  hardware as of this writing -- use the "Advanced" panel to experiment
-  with `write_frame_grab`/`frame_grab_value`/`skip_pixel_grab_reset`/
-  `max_invalid_retries` if the captured image looks wrong.
+  `CaptureFrame`/`SetFrameStream`'s `pixel_count` is clamped to this size.
+- **Capture once** (`CaptureFrame` + `GetFrameChunk`): a one-shot pull --
+  `CaptureFrame` captures into the firmware's static buffer, then the web
+  app loops `GetFrameChunk` calls (see `chunkOffsets()`/`assembleFrame()` in
+  `src/frame.ts`) up to 128 bytes at a time until the whole frame is
+  collected. Rejects with an error if streaming is currently active (stop
+  streaming first).
+- **Streaming** (`SetFrameStream` + `FrameStreamChunk` notifications,
+  Phase E): toggling "Start Streaming" calls `SetFrameStream{enable: true,
+device_index, pixel_count, max_invalid_retries}`, then the firmware
+  repeatedly captures frames on its own (system workqueue loop) and pushes
+  one `FrameStreamChunk` custom Studio notification per 128-byte chunk of
+  each frame -- the web app no longer drives a client-side capture loop.
+  `createFrameAssembler()` in `src/frame.ts` incrementally reassembles
+  chunks (by `frame_id`/`offset`) into a full frame and reports when it's
+  complete so the canvas renders once per frame, not per chunk.
+  "Stop Streaming" calls `SetFrameStream{enable: false, ...}` and
+  unsubscribes. `CaptureFrame` and `SetFrameStream` share the same
+  firmware-side buffer/frame_id, so the UI disables "Capture Once" while
+  streaming is on.
+- Frame rate while streaming is bounded by the sensor itself: a 484-pixel
+  `Pixel_Grab` capture takes roughly 2 seconds (measured on real hardware in
+  Phase D), so expect on the order of 0.4-0.5 fps, not a bug -- the FPS
+  counter reflects this.
+- If ZMK Studio locks while a stream is active, the firmware stops the loop
+  on its own (see the module README's "Security" section) but cannot notify
+  the client that it did so (notifications aren't request/response) -- the
+  web app detects this via the lock-state banner/notification and resets
+  its own "streaming" UI state to match once locked.
 - Each raw pixel byte's bit7 is PG_VALID; the viewer masks it off for
   display (`(byte & 0x7f) << 1` for 8-bit grayscale) but also counts and
   shows bytes with bit7 clear as a data-quality warning.
 
 ## Roadmap
 
-This UI is feature-complete for Phase C (sensor info/diagnostics, settings,
-frame viewer). Hardware validation of the frame-capture procedure is a
-follow-up phase.
+This UI is feature-complete through Phase E (sensor info/diagnostics,
+settings, frame capture/streaming, Studio lock awareness). The frame-capture
+procedure has been hardware-validated (Phase D); Phase E's notification-based
+streaming path has likewise been hardware-validated (see the module
+README's "Frame capture" / "Security" sections and DESIGN.md).

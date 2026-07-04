@@ -95,3 +95,52 @@ export function frameToRgba(bytes: Uint8Array): Uint8ClampedArray {
   }
   return rgba;
 }
+
+/** Incremental assembler for a frame streamed as a sequence of
+ * (offset, data) chunks (e.g. FrameStreamChunk notifications), as opposed
+ * to the one-shot `assembleFrame()` above which takes a complete list of
+ * chunks at once. Tracks how many distinct bytes have been written so it
+ * can report completion without requiring the caller to count chunks or
+ * assume a particular arrival order. */
+export interface FrameAssembler {
+  /** Write one chunk's bytes at `offset`. Returns true once every byte in
+   * [0, totalSize) has been written at least once (chunks may arrive
+   * out of order or, in principle, be retransmitted -- writing the same
+   * range twice is harmless and does not un-complete the frame). */
+  addChunk(offset: number, data: Uint8Array): boolean;
+  /** Current buffer contents (bytes not yet written are 0). Safe to call
+   * before completion for progressive rendering. */
+  getBytes(): Uint8Array;
+  /** Number of distinct bytes written so far. */
+  bytesWritten(): number;
+}
+
+/** Create a fresh incremental assembler for a frame of `totalSize` bytes. */
+export function createFrameAssembler(totalSize: number): FrameAssembler {
+  const bytes = new Uint8Array(totalSize);
+  const written = new Uint8Array(totalSize);
+  let writtenCount = 0;
+
+  return {
+    addChunk(offset: number, data: Uint8Array): boolean {
+      for (let i = 0; i < data.length; i++) {
+        const pos = offset + i;
+        if (pos < 0 || pos >= totalSize) {
+          continue;
+        }
+        bytes[pos] = data[i];
+        if (!written[pos]) {
+          written[pos] = 1;
+          writtenCount++;
+        }
+      }
+      return writtenCount >= totalSize;
+    },
+    getBytes(): Uint8Array {
+      return bytes;
+    },
+    bytesWritten(): number {
+      return writtenCount;
+    },
+  };
+}

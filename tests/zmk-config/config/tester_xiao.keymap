@@ -1,0 +1,51 @@
+/*
+ * Phase E: override tester_xiao's own keymap (shipped in the ZMK fork) so
+ * the test firmware can actually be physically unlocked for ZMK Studio.
+ *
+ * A `.keymap` file placed in the ZMK_CONFIG config directory (this file)
+ * takes precedence over the shield's own `.keymap` -- ZMK's
+ * `boards/post_boards_shields.cmake` builds `KEYMAP_DIRS` with `ZMK_CONFIG`
+ * *prepended* ahead of the shield/board directories, then picks the first
+ * `<candidate>.keymap` match, so this file is found and used instead of
+ * dependencies/zmk/app/boards/shields/tester_xiao/tester_xiao.keymap.
+ *
+ * tests/zmk-config/snippets/pmw3610-trackball/pmw3610-trackball.overlay
+ * restricts tester_xiao's kscan to D0-D3 (4 positions) to avoid conflicting
+ * with the SPI/IRQ pins used by the sensor, so this keymap only needs (and
+ * must define, since a keymap node redefinition is not merged field-by-field)
+ * 4 bindings -- position 0 is `&studio_unlock` (was `&pin0`), positions 1-3
+ * keep the tester's original pin-report macros.
+ */
+
+#include <behaviors.dtsi>
+#include <dt-bindings/zmk/keys.h>
+
+#define PIN_MACRO(name, pin) \
+/ { \
+    macros { \
+        name: name { \
+            compatible = "zmk,behavior-macro"; \
+            wait-ms = <5>; \
+            tap-ms = <5>; \
+            #binding-cells = <0>; \
+            bindings = <&kp P &kp I &kp N &kp SPACE>, pin, <&kp ENTER>; \
+        }; \
+    }; \
+};
+
+PIN_MACRO(pin1, <&kp N1>)
+PIN_MACRO(pin2, <&kp N2>)
+PIN_MACRO(pin3, <&kp N3>)
+
+/ {
+    keymap {
+        compatible = "zmk,keymap";
+
+        default_layer {
+            bindings = <&studio_unlock
+                        &pin1
+                        &pin2
+                        &pin3>;
+        };
+    };
+};

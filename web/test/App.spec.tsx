@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { setupZMKMocks } from "@cormoran/zmk-studio-react-hook/testing";
+import { LockState } from "@zmkfirmware/zmk-studio-ts-client/core";
 import App from "../src/App";
 
 // Mock the ZMK client
@@ -79,6 +80,71 @@ describe("App Component", () => {
       expect(
         screen.getByRole("heading", { name: /Frame Viewer/i })
       ).toBeInTheDocument();
+    });
+  });
+
+  describe("Studio lock state", () => {
+    let mocks: ReturnType<typeof setupZMKMocks>;
+
+    beforeEach(() => {
+      mocks = setupZMKMocks();
+    });
+
+    it("shows a locked banner when a core lock-state notification arrives", async () => {
+      mocks.mockSuccessfulConnection({
+        deviceName: "Test Keyboard",
+        subsystems: ["cormoran__pmw3610", "cormoran_custom_settings"],
+        notifications: [
+          {
+            core: {
+              lockStateChanged: LockState.ZMK_STUDIO_CORE_LOCK_STATE_LOCKED,
+            },
+          },
+        ],
+      });
+
+      const { connect: serial_connect } =
+        await import("@zmkfirmware/zmk-studio-ts-client/transport/serial");
+      (serial_connect as jest.Mock).mockResolvedValue(mocks.mockTransport);
+
+      render(<App />);
+
+      const user = userEvent.setup();
+      await user.click(screen.getByText(/Connect Serial/i));
+
+      await waitFor(() => {
+        expect(screen.getByRole("alert")).toHaveTextContent(/locked/i);
+      });
+    });
+
+    it("does not show a locked banner while unlocked", async () => {
+      mocks.mockSuccessfulConnection({
+        deviceName: "Test Keyboard",
+        subsystems: ["cormoran__pmw3610", "cormoran_custom_settings"],
+        notifications: [
+          {
+            core: {
+              lockStateChanged: LockState.ZMK_STUDIO_CORE_LOCK_STATE_UNLOCKED,
+            },
+          },
+        ],
+      });
+
+      const { connect: serial_connect } =
+        await import("@zmkfirmware/zmk-studio-ts-client/transport/serial");
+      (serial_connect as jest.Mock).mockResolvedValue(mocks.mockTransport);
+
+      render(<App />);
+
+      const user = userEvent.setup();
+      await user.click(screen.getByText(/Connect Serial/i));
+
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /Frame Viewer/i })
+        ).toBeInTheDocument();
+      });
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     });
   });
 });

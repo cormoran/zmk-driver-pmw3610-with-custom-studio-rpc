@@ -1,6 +1,7 @@
 import {
   assembleFrame,
   chunkOffsets,
+  createFrameAssembler,
   frameToRgba,
   isValidPixelByte,
   pixelByteToGray,
@@ -97,5 +98,46 @@ describe("frameToRgba", () => {
     expect(Array.from(rgba.slice(0, 4))).toEqual([0, 0, 0, 255]);
     // pixel 1: masked value 0x7f -> gray 0xfe
     expect(Array.from(rgba.slice(4, 8))).toEqual([0xfe, 0xfe, 0xfe, 255]);
+  });
+});
+
+describe("createFrameAssembler", () => {
+  it("reports incomplete until every byte has been written", () => {
+    const assembler = createFrameAssembler(4);
+    expect(assembler.addChunk(0, Uint8Array.from([0x81, 0x82]))).toBe(false);
+    expect(assembler.bytesWritten()).toBe(2);
+    expect(assembler.addChunk(2, Uint8Array.from([0x83, 0x84]))).toBe(true);
+    expect(assembler.bytesWritten()).toBe(4);
+    expect(Array.from(assembler.getBytes())).toEqual([0x81, 0x82, 0x83, 0x84]);
+  });
+
+  it("handles out-of-order chunks", () => {
+    const assembler = createFrameAssembler(4);
+    expect(assembler.addChunk(2, Uint8Array.from([0x83, 0x84]))).toBe(false);
+    expect(assembler.addChunk(0, Uint8Array.from([0x81, 0x82]))).toBe(true);
+    expect(Array.from(assembler.getBytes())).toEqual([0x81, 0x82, 0x83, 0x84]);
+  });
+
+  it("re-writing the same range is idempotent and does not double-count", () => {
+    const assembler = createFrameAssembler(4);
+    assembler.addChunk(0, Uint8Array.from([0x81, 0x82, 0x83, 0x84]));
+    expect(assembler.bytesWritten()).toBe(4);
+    const stillComplete = assembler.addChunk(0, Uint8Array.from([0x81, 0x82]));
+    expect(stillComplete).toBe(true);
+    expect(assembler.bytesWritten()).toBe(4);
+  });
+
+  it("ignores bytes that fall outside totalSize", () => {
+    const assembler = createFrameAssembler(4);
+    const complete = assembler.addChunk(2, Uint8Array.from([0x81, 0x82, 0x83]));
+    expect(complete).toBe(false); // offsets 0,1 never written
+    expect(Array.from(assembler.getBytes())).toEqual([0, 0, 0x81, 0x82]);
+  });
+
+  it("returns false for a zero-length frame's own semantics only once addChunk is called", () => {
+    // Degenerate case: totalSize 0 means "complete" is vacuously true
+    // as soon as any (even empty) chunk is processed.
+    const assembler = createFrameAssembler(0);
+    expect(assembler.addChunk(0, Uint8Array.from([]))).toBe(true);
   });
 });
