@@ -1,6 +1,8 @@
 #include <errno.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <pb_decode.h>
 #include <pb_encode.h>
@@ -190,6 +192,95 @@ static void handle_write_register_request(const cormoran_pmw3610_WriteRegisterRe
     resp->response_type.write_register = result;
 }
 
+/* Static frame buffer + frame state for CaptureFrame/GetFrameChunk. Static
+ * because the response buffer (ZMK_RPC_CUSTOM_SUBSYSTEM_RESPONSE_BUFFER) is
+ * encoded after the handler returns, and GetFrameChunk copies a slice of
+ * this buffer into the (also static) response on each call -- there is no
+ * per-request lifetime here, only "current frame" state. */
+static uint8_t frame_buf[CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE];
+static uint32_t frame_id;
+static uint16_t frame_len;
+/* GetFrameChunk's response.data is bounded to 128 bytes (pmw3610.options);
+ * with CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE=256 this leaves headroom for the
+ * rest of the Response/CallResponse proto framing overhead. If this bound
+ * or the TX buffer size ever changes, re-check that a full chunk still
+ * fits (see README.md). */
+#define PMW3610_FRAME_CHUNK_SIZE 128
+
+/* A 128-byte data chunk plus the surrounding Response/CallResponse proto
+ * framing (oneof tags, frame_id/offset fields, length-delimited bytes
+ * field header, outer RPC envelope) must fit in one CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE
+ * ring buffer -- this module's build test config
+ * (tests/zmk-config/config/tester_xiao.conf) sets it to 256, well above
+ * PMW3610_FRAME_CHUNK_SIZE + a generous framing allowance. If either this
+ * chunk size or that Kconfig value changes, re-verify a chunk response
+ * still fits (see README.md's "Frame viewer" section). */
+BUILD_ASSERT(PMW3610_FRAME_CHUNK_SIZE + 64 <= CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE,
+             "PMW3610_FRAME_CHUNK_SIZE leaves too little headroom in "
+             "CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE for GetFrameChunkResponse framing overhead");
+
+static void handle_capture_frame_request(const cormoran_pmw3610_CaptureFrameRequest *req,
+                                         cormoran_pmw3610_Response *resp) {
+    const struct device *dev = resolve_device(req->device_index, resp);
+    if (!dev) {
+        return;
+    }
+
+    struct pmw3610_frame_capture_params params = {
+        .pixel_count =
+            (uint16_t)MIN(req->pixel_count, (uint32_t)CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE),
+        .max_invalid_retries = (uint16_t)MIN(req->max_invalid_retries, (uint32_t)UINT16_MAX),
+        .write_frame_grab = req->write_frame_grab,
+        .frame_grab_value = (uint8_t)MIN(req->frame_grab_value, (uint32_t)0xFF),
+        .write_pixel_grab_reset = !req->skip_pixel_grab_reset,
+    };
+
+    uint16_t out_count = 0;
+    int err = pmw3610_capture_frame(dev, &params, frame_buf, sizeof(frame_buf), &out_count);
+    if (err) {
+        set_error(resp, "CaptureFrame failed: errno %d", err);
+        return;
+    }
+
+    frame_id++;
+    frame_len = out_count;
+
+    cormoran_pmw3610_CaptureFrameResponse result = cormoran_pmw3610_CaptureFrameResponse_init_zero;
+    result.frame_id = frame_id;
+    result.pixel_count = out_count;
+    result.chunk_size = PMW3610_FRAME_CHUNK_SIZE;
+
+    resp->which_response_type = cormoran_pmw3610_Response_capture_frame_tag;
+    resp->response_type.capture_frame = result;
+}
+
+static void handle_get_frame_chunk_request(const cormoran_pmw3610_GetFrameChunkRequest *req,
+                                           cormoran_pmw3610_Response *resp) {
+    if (frame_id == 0 || req->frame_id != frame_id) {
+        set_error(resp, "frame_id %u not found (current frame_id %u)", (unsigned int)req->frame_id,
+                  (unsigned int)frame_id);
+        return;
+    }
+    if (req->offset >= frame_len) {
+        set_error(resp, "offset %u out of range (frame length %u)", (unsigned int)req->offset,
+                  (unsigned int)frame_len);
+        return;
+    }
+
+    uint32_t remaining = frame_len - req->offset;
+    uint32_t chunk = MIN(remaining, PMW3610_FRAME_CHUNK_SIZE);
+
+    cormoran_pmw3610_GetFrameChunkResponse result =
+        cormoran_pmw3610_GetFrameChunkResponse_init_zero;
+    result.frame_id = frame_id;
+    result.offset = req->offset;
+    result.data.size = chunk;
+    memcpy(result.data.bytes, &frame_buf[req->offset], chunk);
+
+    resp->which_response_type = cormoran_pmw3610_Response_get_frame_chunk_tag;
+    resp->response_type.get_frame_chunk = result;
+}
+
 static bool pmw3610_rpc_handle_request(const zmk_custom_CallRequest *raw_request,
                                        pb_callback_t *encode_response) {
     cormoran_pmw3610_Response *resp =
@@ -217,6 +308,12 @@ static bool pmw3610_rpc_handle_request(const zmk_custom_CallRequest *raw_request
         break;
     case cormoran_pmw3610_Request_write_register_tag:
         handle_write_register_request(&req.request_type.write_register, resp);
+        break;
+    case cormoran_pmw3610_Request_capture_frame_tag:
+        handle_capture_frame_request(&req.request_type.capture_frame, resp);
+        break;
+    case cormoran_pmw3610_Request_get_frame_chunk_tag:
+        handle_get_frame_chunk_request(&req.request_type.get_frame_chunk, resp);
         break;
     default:
         LOG_WRN("Unsupported pmw3610 request type: %d", req.which_request_type);

@@ -58,12 +58,62 @@ message WriteRegisterRequest {
 
 message WriteRegisterResponse {}
 
+// Captures a still frame (pixel array) from the sensor into a firmware-side
+// static buffer. The frame-grab procedure is not documented in the public
+// datasheet; the knobs below let the (hardware-validated in a later phase)
+// procedure be tuned without reflashing. Defaults match the common PixArt
+// pixel-grab convention.
+message CaptureFrameRequest {
+    uint32 device_index = 1;
+    // Number of pixels to read. 0 means the driver default (484 = 22x22).
+    // Clamped to the firmware's static frame buffer size
+    // (CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE).
+    uint32 pixel_count = 2;
+    // Consecutive invalid-read retries allowed per pixel before the capture
+    // aborts (returning whatever was collected so far). 0 means the driver
+    // default (300).
+    uint32 max_invalid_retries = 3;
+    // Write FRAME_GRAB (0x36) = frame_grab_value before reading pixels.
+    bool write_frame_grab = 4;
+    uint32 frame_grab_value = 5;
+    // Skip writing PIXEL_GRAB (0x35) = 0x00 before reading (default is to
+    // write it, matching the driver's write_pixel_grab_reset default=true).
+    bool skip_pixel_grab_reset = 6;
+}
+
+message CaptureFrameResponse {
+    uint32 frame_id = 1;
+    // Number of pixel bytes actually collected (<= requested pixel_count;
+    // may be less if the capture aborted early on repeated invalid reads).
+    uint32 pixel_count = 2;
+    // Chunk size used by GetFrameChunk for this frame (fixed, currently
+    // 128; see pmw3610.options for the actual bound).
+    uint32 chunk_size = 3;
+}
+
+// Fetch a chunk of a previously captured frame's pixel bytes.
+message GetFrameChunkRequest {
+    uint32 frame_id = 1;
+    uint32 offset = 2;
+}
+
+message GetFrameChunkResponse {
+    uint32 frame_id = 1;
+    uint32 offset = 2;
+    // Raw pixel bytes (bit7 = PG_VALID, bits[6:0] = pixel value). The host
+    // is responsible for masking/scaling; invalid (bit7==0) bytes are kept
+    // as-is so the host can detect/report capture quality.
+    bytes data = 3;
+}
+
 message Request {
     oneof request_type {
         GetInfoRequest get_info = 1;
         ReadDiagnosticsRequest read_diagnostics = 2;
         ReadRegisterRequest read_register = 3;
         WriteRegisterRequest write_register = 4;
+        CaptureFrameRequest capture_frame = 5;
+        GetFrameChunkRequest get_frame_chunk = 6;
     }
 }
 
@@ -76,5 +126,7 @@ message Response {
         ReadDiagnosticsResponse read_diagnostics = 3;
         ReadRegisterResponse read_register = 4;
         WriteRegisterResponse write_register = 5;
+        CaptureFrameResponse capture_frame = 6;
+        GetFrameChunkResponse get_frame_chunk = 7;
     }
 }

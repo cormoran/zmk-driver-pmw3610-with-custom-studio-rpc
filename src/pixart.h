@@ -72,6 +72,14 @@ struct pixart_data {
     int64_t dy;
     int64_t last_smp_time;
     int64_t last_rpt_time;
+
+    /* Set for the duration of pmw3610_capture_frame() (guarded by `lock`).
+     * pmw3610_report_data() checks this and skips (returning 0 without
+     * touching the sensor) while a frame capture is in progress -- the
+     * trigger work item may already be queued on the system workqueue when
+     * capture starts, so this is a belt-and-braces check in addition to
+     * disabling the motion IRQ. */
+    bool capture_active;
 };
 
 // device config data structure

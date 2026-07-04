@@ -19,7 +19,7 @@ describe("App Component", () => {
       render(<App />);
 
       expect(screen.getByText(/PMW3610 Trackball/i)).toBeInTheDocument();
-      expect(screen.getByText(/Custom Studio RPC Demo/i)).toBeInTheDocument();
+      expect(screen.getByText(/frame viewer/i)).toBeInTheDocument();
     });
 
     it("should render connection button when disconnected", () => {
@@ -42,10 +42,10 @@ describe("App Component", () => {
       mocks = setupZMKMocks();
     });
 
-    it("should connect to device when connect button is clicked", async () => {
+    it("should connect to device and render the feature cards", async () => {
       mocks.mockSuccessfulConnection({
         deviceName: "Test Keyboard",
-        subsystems: ["cormoran__pmw3610"],
+        subsystems: ["cormoran__pmw3610", "cormoran_custom_settings"],
       });
 
       const { connect: serial_connect } =
@@ -67,7 +67,18 @@ describe("App Component", () => {
       });
 
       expect(screen.getByText(/Disconnect/i)).toBeInTheDocument();
-      expect(screen.getByText(/Sensor Info/i)).toBeInTheDocument();
+      expect(
+        screen.getByRole("heading", { name: /Sensor/i })
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("heading", { name: /Diagnostics/i })
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("heading", { name: /Settings/i })
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("heading", { name: /Frame Viewer/i })
+      ).toBeInTheDocument();
     });
   });
 });

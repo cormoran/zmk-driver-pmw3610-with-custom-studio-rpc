@@ -3,32 +3,33 @@ import {
   createConnectedMockZMKApp,
   ZMKAppProvider,
 } from "@cormoran/zmk-studio-react-hook/testing";
-import { RPCTestSection, SUBSYSTEM_IDENTIFIER } from "../src/App";
+import { FrameViewer, PMW3610_SUBSYSTEM_IDENTIFIER } from "../src/FrameViewer";
 
-describe("RPCTestSection Component", () => {
+describe("FrameViewer Component", () => {
   describe("With Subsystem", () => {
-    it("should render RPC controls when subsystem is found", () => {
+    it("renders capture controls and the size selector", () => {
       const mockZMKApp = createConnectedMockZMKApp({
         deviceName: "Test Device",
-        subsystems: [SUBSYSTEM_IDENTIFIER],
+        subsystems: [PMW3610_SUBSYSTEM_IDENTIFIER],
       });
 
       render(
         <ZMKAppProvider value={mockZMKApp}>
-          <RPCTestSection />
+          <FrameViewer />
         </ZMKAppProvider>
       );
 
-      expect(screen.getByText(/Sensor Info/i)).toBeInTheDocument();
       expect(
-        screen.getByText(/Query PMW3610 device info/i)
+        screen.getByRole("heading", { name: /Frame Viewer/i })
       ).toBeInTheDocument();
-      expect(screen.getByText(/Get Info/i)).toBeInTheDocument();
+      expect(screen.getByText(/Capture Once/i)).toBeInTheDocument();
+      expect(screen.getByText(/Start Streaming/i)).toBeInTheDocument();
+      expect(screen.getByLabelText(/Size/i)).toBeInTheDocument();
     });
   });
 
   describe("Without Subsystem", () => {
-    it("should show warning when subsystem is not found", () => {
+    it("should show a warning when the subsystem is not found", () => {
       const mockZMKApp = createConnectedMockZMKApp({
         deviceName: "Test Device",
         subsystems: [],
@@ -36,22 +37,19 @@ describe("RPCTestSection Component", () => {
 
       render(
         <ZMKAppProvider value={mockZMKApp}>
-          <RPCTestSection />
+          <FrameViewer />
         </ZMKAppProvider>
       );
 
       expect(
         screen.getByText(/Subsystem "cormoran__pmw3610" not found/i)
       ).toBeInTheDocument();
-      expect(
-        screen.getByText(/Make sure your firmware includes the PMW3610 module/i)
-      ).toBeInTheDocument();
     });
   });
 
   describe("Without ZMKAppContext", () => {
     it("should not render when ZMKAppContext is not provided", () => {
-      const { container } = render(<RPCTestSection />);
+      const { container } = render(<FrameViewer />);
 
       expect(container.firstChild).toBeNull();
     });

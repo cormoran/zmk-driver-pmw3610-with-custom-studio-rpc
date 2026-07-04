@@ -1,7 +1,11 @@
 .app {
-  max-width: 800px;
+  max-width: 960px;
   margin: 0 auto;
   padding: 2rem;
+}
+
+.app-header {
+  margin-bottom: 1.5rem;
 }
 
 .card {
@@ -14,6 +18,24 @@
 .btn {
   padding: 0.5rem 1rem;
   cursor: pointer;
+  border: 1px solid #888;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.btn-primary {
+  border-color: #1f6feb;
+  background: #1f6feb;
+  color: #fff;
+}
+
+.btn-secondary {
+  border-color: #666;
+}
+
+.btn-danger {
+  border-color: #b42318;
+  color: #b42318;
 }
 
 .btn:disabled {
@@ -21,11 +43,118 @@
   cursor: not-allowed;
 }
 
-.input-group {
-  display: flex;
-  align-items: center;
+.form-grid {
+  display: grid;
+  grid-template-columns: minmax(120px, 220px) minmax(0, 1fr);
   gap: 0.5rem;
   margin: 1rem 0;
+  align-items: center;
+}
+
+.form-grid label,
+.form-label {
+  align-self: center;
+  font-weight: 600;
+}
+
+.form-grid input,
+.form-grid select {
+  min-width: 0;
+  padding: 0.45rem 0.5rem;
+}
+
+.form-grid input[type="checkbox"] {
+  justify-self: start;
+}
+
+.inline-label {
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.settings-table-wrap {
+  overflow-x: auto;
+  border: 1px solid #ddd;
+  margin-top: 1rem;
+}
+
+.settings-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+
+.settings-table th,
+.settings-table td {
+  padding: 0.5rem;
+  border-bottom: 1px solid #eee;
+  text-align: left;
+  vertical-align: top;
+}
+
+.settings-table th {
+  background: #f6f8fa;
+}
+
+.empty-message {
+  color: #555;
+}
+
+.warning-message {
+  padding: 0.75rem;
+  border: 1px solid #f0c36d;
+  background: #fff8e6;
+  border-radius: 4px;
+}
+
+.error-message {
+  padding: 0.75rem;
+  border: 1px solid #b42318;
+  background: #fdecea;
+  border-radius: 4px;
+  color: #b42318;
+}
+
+.warning-inline {
+  color: #b42318;
+}
+
+.setting-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 1rem;
+  margin: 1rem 0 0;
+}
+
+.setting-summary div {
+  border-top: 1px solid #ddd;
+  padding-top: 0.75rem;
+}
+
+.setting-summary dt {
+  color: #555;
+  font-size: 0.85rem;
+}
+
+.setting-summary dd {
+  margin: 0.25rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.setting-summary pre {
+  margin: 0;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
 }
 
 .response-box {
@@ -37,4 +166,45 @@
 .response-box pre {
   margin: 0;
   overflow-x: auto;
+}
+
+.advanced-panel {
+  margin: 1rem 0;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+}
+
+.advanced-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.frame-canvas-wrap {
+  margin-top: 1rem;
+  display: flex;
+  justify-content: center;
+  background: #111;
+  padding: 1rem;
+  border-radius: 4px;
+}
+
+.frame-canvas {
+  image-rendering: pixelated;
+  background: #000;
+}
+
+.app-footer {
+  color: #555;
+  font-size: 0.9rem;
+}
+
+@media (max-width: 640px) {
+  .app {
+    padding: 1rem;
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
 }

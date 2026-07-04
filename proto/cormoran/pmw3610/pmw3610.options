@@ -3,3 +3,4 @@
 
 cormoran.pmw3610.ErrorResponse.message        max_size:64
 cormoran.pmw3610.GetInfoResponse.devices      max_count:2
+cormoran.pmw3610.GetFrameChunkResponse.data    max_size:128

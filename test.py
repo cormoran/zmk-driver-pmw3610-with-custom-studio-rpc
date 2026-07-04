@@ -90,6 +90,9 @@ class WestCommandsTests(unittest.TestCase):
                         "CONFIG_ZMK_STUDIO=y",
                         "CONFIG_ZMK_PMW3610_STUDIO_RPC=y",
                         "CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE=256",
+                        # Frame capture buffer (Phase C): default size, present
+                        # whenever CONFIG_ZMK_PMW3610_STUDIO_RPC=y.
+                        "CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE=484",
                     ],
                     device=[
                         "DT_COMPAT_HAS_OKAY_cormoran_pmw3610",
@@ -105,6 +108,7 @@ class WestCommandsTests(unittest.TestCase):
                         "CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y",
                         "CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE=256",
                         "CONFIG_ZMK_STUDIO_RPC_RX_BUF_SIZE=128",
+                        "CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE=484",
                     ],
                     device=[
                         "DT_COMPAT_HAS_OKAY_cormoran_pmw3610",

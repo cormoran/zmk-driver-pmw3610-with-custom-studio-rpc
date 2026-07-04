@@ -20,6 +20,23 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 
+//////// Frame capture defaults (see pmw3610_capture_frame) //////////
+// The public datasheet does not document the pixel-grab procedure; these
+// match the common PixArt pixel-grab convention and are tunable per-request
+// (struct pmw3610_frame_capture_params) pending hardware validation.
+#define PMW3610_FRAME_CAPTURE_DEFAULT_PIXEL_COUNT 484 // 22 x 22
+#define PMW3610_FRAME_CAPTURE_DEFAULT_MAX_INVALID_RETRIES 300
+#define PMW3610_FRAME_CAPTURE_DEFAULT_FRAME_GRAB_VALUE 0x00
+#define PMW3610_PIXEL_GRAB_VALID_BIT BIT(7)
+// Busy-wait between invalid-pixel retries (datasheet-adjacent convention;
+// short enough to not matter for the 2s timeout budget below).
+#define PMW3610_FRAME_CAPTURE_RETRY_DELAY_US 20
+// Unconditional wall-clock bound on the whole read loop so a caller on the
+// Studio RPC thread can never be blocked indefinitely by a misbehaving
+// sensor (e.g. PG_VALID never asserting). Independent of pixel_count /
+// max_invalid_retries -- whichever bound is hit first wins.
+#define PMW3610_FRAME_CAPTURE_TIMEOUT_MS 2000
+
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
 // delayable work is defined for this purpose           //
@@ -446,6 +463,15 @@ static int pmw3610_report_data(const struct device *dev) {
     }
 
     k_mutex_lock(&data->lock, K_FOREVER);
+    if (unlikely(data->capture_active)) {
+        /* A frame capture is in progress on another thread (e.g. Studio
+         * RPC). It already disables the motion IRQ, but the trigger work
+         * item may have been queued just before that happened -- skip
+         * touching the sensor here rather than interleaving SPI
+         * transactions with the capture loop. */
+        k_mutex_unlock(&data->lock);
+        return 0;
+    }
     struct pixart_runtime_config rt = data->runtime;
     k_mutex_unlock(&data->lock);
 
@@ -1121,5 +1147,135 @@ int pmw3610_set_report_interval_min(const struct device *dev, uint32_t value_ms)
     k_mutex_lock(&data->lock, K_FOREVER);
     data->runtime.report_interval_min_ms = value_ms;
     k_mutex_unlock(&data->lock);
+    return 0;
+}
+
+/* Recover normal navigation after a frame capture, which disturbs it: reset
+ * the async init state machine to step 0 and (re)schedule the init work,
+ * exactly like pmw3610_resume() does for the "not ready yet" case. Caller
+ * must hold data->lock. */
+static void pmw3610_capture_frame_recover_locked(const struct device *dev) {
+    struct pixart_data *data = dev->data;
+
+    data->ready = false;
+    data->async_init_step = 0;
+    data->async_init_retry_count = 0;
+    k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
+}
+
+int pmw3610_capture_frame(const struct device *dev,
+                          const struct pmw3610_frame_capture_params *params, uint8_t *buf,
+                          uint16_t buf_len, uint16_t *out_count) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    if (!buf || buf_len == 0 || !out_count) {
+        return -EINVAL;
+    }
+
+    struct pixart_data *data = dev->data;
+
+    struct pmw3610_frame_capture_params p = {
+        .pixel_count = PMW3610_FRAME_CAPTURE_DEFAULT_PIXEL_COUNT,
+        .max_invalid_retries = PMW3610_FRAME_CAPTURE_DEFAULT_MAX_INVALID_RETRIES,
+        .write_frame_grab = false,
+        .frame_grab_value = PMW3610_FRAME_CAPTURE_DEFAULT_FRAME_GRAB_VALUE,
+        .write_pixel_grab_reset = true,
+    };
+    if (params) {
+        if (params->pixel_count != 0) {
+            p.pixel_count = params->pixel_count;
+        }
+        if (params->max_invalid_retries != 0) {
+            p.max_invalid_retries = params->max_invalid_retries;
+        }
+        p.write_frame_grab = params->write_frame_grab;
+        p.frame_grab_value = params->frame_grab_value;
+        p.write_pixel_grab_reset = params->write_pixel_grab_reset;
+    }
+    if (p.pixel_count > buf_len) {
+        p.pixel_count = buf_len;
+    }
+
+    *out_count = 0;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+
+    if (!data->ready) {
+        k_mutex_unlock(&data->lock);
+        return -EBUSY;
+    }
+
+    data->capture_active = true;
+    k_mutex_unlock(&data->lock);
+
+    /* Disable the motion IRQ outside the lock (matches pmw3610_set_interrupt
+     * usage elsewhere in this file, which does not require data->lock). */
+    pmw3610_set_interrupt(dev, false);
+
+    int err = 0;
+    if (p.write_pixel_grab_reset) {
+        err = pmw3610_write_reg(dev, PMW3610_REG_PIXEL_GRAB, 0x00);
+    }
+    if (!err && p.write_frame_grab) {
+        err = pmw3610_write_reg(dev, PMW3610_REG_FRAME_GRAB, p.frame_grab_value);
+    }
+
+    uint16_t collected = 0;
+    int64_t deadline = k_uptime_get() + PMW3610_FRAME_CAPTURE_TIMEOUT_MS;
+
+    if (!err) {
+        for (uint16_t i = 0; i < p.pixel_count; i++) {
+            uint16_t invalid_retries = 0;
+
+            for (;;) {
+                if (k_uptime_get() >= deadline) {
+                    LOG_WRN("Frame capture timed out after %u pixel(s) (of %u requested)",
+                            collected, p.pixel_count);
+                    goto capture_done;
+                }
+
+                uint8_t value;
+                int read_err = pmw3610_read_reg(dev, PMW3610_REG_PIXEL_GRAB, &value);
+                if (read_err) {
+                    err = read_err;
+                    LOG_ERR("Frame capture: PIXEL_GRAB read failed (errno %d) after %u pixel(s)",
+                            read_err, collected);
+                    goto capture_done;
+                }
+
+                if (value & PMW3610_PIXEL_GRAB_VALID_BIT) {
+                    /* Store the raw byte (bit7 kept) -- the host masks
+                     * bits[6:0] and can inspect bit7 for validity. */
+                    buf[collected++] = value;
+                    break;
+                }
+
+                invalid_retries++;
+                if (invalid_retries >= p.max_invalid_retries) {
+                    LOG_WRN("Frame capture: %u consecutive invalid reads at pixel %u, aborting "
+                            "with %u pixel(s) collected",
+                            invalid_retries, i, collected);
+                    goto capture_done;
+                }
+                k_busy_wait(PMW3610_FRAME_CAPTURE_RETRY_DELAY_US);
+            }
+        }
+    }
+
+capture_done:
+    *out_count = collected;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    pmw3610_capture_frame_recover_locked(dev);
+    data->capture_active = false;
+    k_mutex_unlock(&data->lock);
+
+    /* IRQ is re-enabled once async init reaches ASYNC_INIT_STEP_COUNT (see
+     * pmw3610_async_init()), matching pmw3610_resume()'s not-ready path. */
+
+    if (err) {
+        return err;
+    }
     return 0;
 }

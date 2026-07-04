@@ -137,6 +137,60 @@ int pmw3610_set_force_awake(const struct device *dev, bool enabled);
 int pmw3610_set_smart_algorithm(const struct device *dev, bool enabled);
 int pmw3610_set_report_interval_min(const struct device *dev, uint32_t value_ms);
 
+/** @brief Tunable knobs for pmw3610_capture_frame().
+ *
+ * The public 8-page PMW3610 datasheet documents the PIXEL_GRAB (0x35) /
+ * FRAME_GRAB (0x36) registers but not the exact procedure required to read
+ * a still frame. This struct exposes the procedure's variable points so it
+ * can be tuned (e.g. via the Studio RPC CaptureFrame request) without
+ * reflashing, pending hardware validation.
+ */
+struct pmw3610_frame_capture_params {
+    /** Pixels to read. 0 means the driver default (484 = 22x22). */
+    uint16_t pixel_count;
+    /** Consecutive invalid-read (PG_VALID bit7 clear) retries allowed per
+     * pixel before the capture aborts early, keeping whatever was
+     * collected so far. 0 means the driver default (300). */
+    uint16_t max_invalid_retries;
+    /** Write FRAME_GRAB (0x36) = frame_grab_value before reading pixels. */
+    bool write_frame_grab;
+    /** Value written to FRAME_GRAB when write_frame_grab is set. */
+    uint8_t frame_grab_value;
+    /** Write PIXEL_GRAB (0x35) = 0x00 before reading (resets the sensor's
+     * internal pixel pointer). Default true. */
+    bool write_pixel_grab_reset;
+};
+
+/** @brief Capture a still frame (raw pixel array) from the sensor.
+ *
+ * Disables the motion IRQ and sets an internal "capture active" flag for
+ * the duration of the call so pmw3610_report_data() does not interleave
+ * SPI transactions with the capture loop. Frame grab disturbs normal
+ * navigation, so on return (success or failure) this function always
+ * triggers the same power-up-reset + reconfigure flow used by
+ * pmw3610_resume() (async init from step 0) before releasing the capture
+ * lock, and re-enables the motion IRQ once that flow schedules.
+ *
+ * Bounded to roughly 2 seconds of wall-clock time regardless of
+ * pixel_count/max_invalid_retries, so a caller on the Studio RPC thread
+ * cannot be blocked indefinitely by a misbehaving sensor.
+ *
+ * @param dev PMW3610 device.
+ * @param params Capture tuning knobs (NULL uses all defaults).
+ * @param buf Output buffer for raw pixel bytes (bit7 = PG_VALID, bits[6:0]
+ *   = pixel value; the caller is responsible for masking/interpreting).
+ * @param buf_len Capacity of buf, in bytes.
+ * @param out_count Number of bytes actually collected (<= buf_len and <=
+ *   requested pixel_count; may be less than requested if the capture
+ *   aborted early).
+ * @return 0 on success (including a partial/early-aborted capture with
+ *   out_count > 0), negative errno on failure (-ENODEV, -EINVAL for a zero
+ *   buf_len, -EBUSY if the device is not ready, or a SPI error).
+ */
+int pmw3610_capture_frame(const struct device *dev,
+                          const struct pmw3610_frame_capture_params *params, uint8_t *buf,
+                          uint16_t buf_len, uint16_t *out_count);
+
 #ifdef __cplusplus
 }
 #endif

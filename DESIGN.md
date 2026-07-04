@@ -220,20 +220,49 @@ duplicate it.
 
 PMW3610 exposes `PIXEL_GRAB` (0x35) and `FRAME_GRAB` (0x36). The public 8-page
 datasheet documents only the register table, not the procedure, so the
-implementation follows the common PixArt pixel-grab convention and is
-hardware-validated (we have the sensor wired to a XIAO nRF52840 + J-Link):
+implementation follows the common PixArt pixel-grab convention. **Implemented
+in Phase C; hardware validation of the exact procedure is deferred to
+Phase D** (the DESIGN.md text below described this as already
+hardware-validated in the original plan -- that was aspirational/out of
+order; validation has not happened yet as of Phase C).
 
-1. Disable motion IRQ; set an atomic `capture_active` flag (report path skips).
-2. Write `PIXEL_GRAB` = 0x00 to reset the pixel pointer (and/or `FRAME_GRAB`
-   latch — validated empirically via the register read/write RPC).
-3. Loop `count` times: read `PIXEL_GRAB`; bit7 = PG_VALID, bits[6:0] = pixel.
-   Valid → store & advance; invalid → retry (bounded).
-4. Power-up reset + full reconfigure (navigation is disturbed by frame grab),
-   re-enable IRQ.
+Procedure (`pmw3610_capture_frame()` in `src/pmw3610.c`), matching
+`struct pmw3610_frame_capture_params` in
+`include/cormoran/pmw3610/pmw3610_api.h`:
 
-Pixel count is a request parameter (default 484 = 22x22); the exact array size
-is confirmed on hardware. Raw register RPC allows tuning the procedure without
-reflashing.
+1. Require `data->ready` (else `-EBUSY`); take `data->lock`, set
+   `data->capture_active = true` (checked and short-circuited by
+   `pmw3610_report_data()`, which returns 0 without touching the sensor
+   while a capture is active -- belt-and-braces alongside disabling the
+   IRQ, since the trigger work item may already be queued when capture
+   starts), release the lock, then `pmw3610_set_interrupt(dev, false)`.
+2. If `write_pixel_grab_reset` (default true): write `PIXEL_GRAB` = 0x00.
+   If `write_frame_grab` (default false): write `FRAME_GRAB` =
+   `frame_grab_value` (default 0x00).
+3. Loop up to `pixel_count` times: read `PIXEL_GRAB`; bit7 = PG_VALID,
+   bits[6:0] = pixel value. Valid → store the **raw byte** (bit7 kept; the
+   host masks it) and advance; invalid → `k_busy_wait(20us)` and retry, up
+   to `max_invalid_retries` (default 300) *consecutive* invalid reads before
+   aborting early with whatever was collected. An unconditional wall-clock
+   deadline (`k_uptime_get()`-based, `PMW3610_FRAME_CAPTURE_TIMEOUT_MS` =
+   2000ms) bounds the entire loop regardless of the above, so the Studio RPC
+   thread can never be blocked indefinitely by a misbehaving sensor.
+4. Regardless of success/failure/timeout: re-take the lock, reset the async
+   init state machine to step 0 (`data->ready = false;
+   data->async_init_step = 0; data->async_init_retry_count = 0;
+   k_work_schedule(&data->init_work, ...)` -- exactly the not-ready path of
+   `pmw3610_resume()`), clear `capture_active`, release the lock. The motion
+   IRQ is re-enabled once async init reaches its last step (existing
+   `pmw3610_async_init()` behavior), not directly in this function.
+
+Pixel count is a request parameter (default 484 = 22x22, clamped to the
+firmware's static frame buffer, `CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE`).
+Raw register RPC (`ReadRegister`/`WriteRegister`) allows tuning the procedure
+without reflashing; all five knobs
+(`pixel_count`/`max_invalid_retries`/`write_frame_grab`/`frame_grab_value`/
+`skip_pixel_grab_reset` -- the last one inverted from the driver's
+`write_pixel_grab_reset` so the RPC default (`false`) matches "do the normal
+thing") are also exposed directly on `CaptureFrameRequest`.
 
 ## RPC proto (`cormoran.pmw3610`)
 
@@ -259,30 +288,62 @@ Response = oneof { ErrorResponse, GetInfoResponse, ReadDiagnosticsResponse,
   the message text. Implemented in Phase B. **WriteRegister has no
   additional validation beyond fitting in a byte** -- it is a raw register
   write, documented as a debug facility in README.md.
-- `CaptureFrame{device_index, pixel_count}` → captures into a static buffer,
-  returns `{frame_id, pixel_count, chunk_size}`. **Phase C, not yet
-  implemented.**
-- `GetFrameChunk{frame_id, offset}` → `{offset, bytes data}` (chunk ≤ 128 B,
-  `.options` bounded). Web polls chunks; "streaming" = repeated captures.
-  **Phase C, not yet implemented.**
+- `CaptureFrame{device_index, pixel_count, max_invalid_retries,
+  write_frame_grab, frame_grab_value, skip_pixel_grab_reset}` → captures into
+  a static buffer, returns `{frame_id, pixel_count, chunk_size}`. Implemented
+  in Phase C. `pixel_count` is clamped to
+  `CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE` (0 → driver default 484).
+  `frame_id` is a monotonically increasing counter (starts at 1); errors
+  (bad `device_index`, driver failure) produce an `ErrorResponse`, not a
+  crash, including with zero PMW3610 devices present (native_sim).
+- `GetFrameChunk{frame_id, offset}` → `{frame_id, offset, bytes data}` (chunk
+  ≤ 128 B, `.options` bounded, fixed `chunk_size` = 128). Implemented in
+  Phase C. Validates `frame_id` matches the current captured frame and
+  `offset < length`; the web app drives the chunk loop sequentially (not
+  parallel) and "streaming" = repeated `CaptureFrame` + drain-`GetFrameChunk`
+  cycles, not a separate continuous-streaming RPC verb.
 - No 64-bit proto fields (nanopb + `CONFIG_ZMK_STUDIO` restriction).
 - Sub-messages require `has_<field> = true` on the firmware side.
 
-RPC buffer note: default `ZMK_STUDIO_RPC_TX_BUF_SIZE` is 64 — README and tester
-config must raise it (e.g. 256) for chunked frame responses, and
-`ZMK_STUDIO_RPC_RX_BUF_SIZE` to 128 for custom settings.
+RPC buffer note: default `ZMK_STUDIO_RPC_TX_BUF_SIZE` is 64 — README, tester
+config, and `tests/studio/native_sim.conf` all raise it to 256 for chunked
+frame responses (a `BUILD_ASSERT` in `pmw3610_handler.c` enforces this at
+compile time), and `ZMK_STUDIO_RPC_RX_BUF_SIZE` to 128 for custom settings.
 
 ## Web UI (web/)
 
 Template stack: React + vite + buf/ts-proto + `@cormoran/zmk-studio-react-hook`.
+Implemented in Phase C as four cards plus the connection card:
 
-- Connection card (from template).
-- Sensor info + diagnostics card (poll).
-- Settings panel: generic custom-settings client (list/get/set/save/discard/
-  reset for subsystem `cormoran__pmw3610`) — reuse patterns from
-  zmk-feature-custom-settings web app.
-- Frame viewer: capture loop with canvas rendering (NxN grayscale, N selectable
-  19–22, default 22), FPS counter, start/stop, single-shot, SQUAL overlay.
+- Connection card (from template, kept as-is).
+- `SensorInfo.tsx`: "Sensor" card (`GetInfo` on connect + refresh button,
+  device selector when more than one device) and "Diagnostics" card
+  (`ReadDiagnostics`, manual + 1s auto-refresh toggle).
+- `SettingsPanel.tsx`: generic custom-settings editor for subsystem
+  `cormoran__pmw3610`, talking to zmk-feature-custom-settings' *separate*
+  Studio RPC subsystem (`cormoran_custom_settings`) — list with
+  values/constraints, inline int32/bool/string edit, write with
+  memory/persist mode, save/discard/reset buttons, per-row unsaved
+  indicator. Deviation from the original plan: trimmed relative to
+  zmk-feature-custom-settings' own reference app (no free-form
+  subsystem/key filter UI, no JSON import/export panel, no array
+  push/pop) since this module's settings are all fixed-key scalars.
+- `FrameViewer.tsx`: size selector (19/20/21/22, default 22), device index
+  input, capture-once button, start/stop streaming toggle (sequential
+  capture loop, not a fixed-interval timer), advanced collapsible
+  (`write_frame_grab`, hex `frame_grab_value`, `skip_pixel_grab_reset`,
+  `max_invalid_retries`), canvas render (grayscale, 12px/sensor-pixel,
+  nearest-neighbor), invalid-byte-count warning, FPS counter.
+- `frame.ts`: pure functions (`assembleFrame`, `chunkOffsets`,
+  `pixelByteToGray`, `frameToRgba`, `isValidPixelByte`) extracted for unit
+  testing without a canvas/DOM dependency.
+- Proto vendoring: `web/buf.gen.yaml` lists a *second* `buf generate` input
+  directory pointing directly at
+  `../dependencies/zmk-feature-custom-settings/proto` (not vendored into
+  this repo's own `proto/` tree, which would make the firmware-side nanopb
+  glob in `CMakeLists.txt` pick it up too and generate a conflicting second
+  copy of the `cormoran.zmk.custom_settings` package, failing to link into
+  the `pmw3610_settings_rpc` test artifact that includes both modules).
 
 ## Test config (tests/zmk-config)
 
@@ -325,8 +386,18 @@ Template stack: React + vite + buf/ts-proto + `@cormoran/zmk-studio-react-hook`.
 5. Exercise `ReadDiagnostics`/`ReadRegister`/`WriteRegister` against a real
    device (index bounds, register 0x85 RES_STEP round trip, error path for
    an out-of-range device_index).
-6. `CaptureFrame` + chunks (Phase C) → assemble image, verify plausible
-   pixel data (covered sensor = dark, lit = bright); tune procedure via
-   register RPC if PG_VALID never asserts; determine true array size.
+6. `CaptureFrame` + `GetFrameChunk` (implemented in Phase C, **not yet
+   hardware-validated** -- this is the primary Phase D task) → assemble
+   image, verify plausible pixel data (covered sensor = dark, lit = bright);
+   tune procedure via the `CaptureFrameRequest` knobs
+   (`write_frame_grab`/`frame_grab_value`/`skip_pixel_grab_reset`/
+   `max_invalid_retries`) or raw register RPC if PG_VALID never asserts;
+   confirm the true usable array size (484 = 22x22 is an assumption, not yet
+   confirmed against real sensor output). Example CLI JSON request/response
+   shapes are in README.md's "Frame capture" section.
 7. Web UI smoke test (vite dev + Chrome WebSerial) if environment allows;
-   otherwise CLI-driven equivalent via `custom-call`.
+   otherwise CLI-driven equivalent via `custom-call`. In particular verify
+   the Frame Viewer's streaming loop against real RPC round-trip latency
+   (the web-side "streaming" is a sequential capture loop with no fixed
+   interval, so FPS is bounded entirely by hardware/RPC speed, not
+   simulated in any test so far).
