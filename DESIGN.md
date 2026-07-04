@@ -218,51 +218,59 @@ duplicate it.
 
 ## Frame capture
 
-PMW3610 exposes `PIXEL_GRAB` (0x35) and `FRAME_GRAB` (0x36). The public 8-page
-datasheet documents only the register table, not the procedure, so the
-implementation follows the common PixArt pixel-grab convention. **Implemented
-in Phase C; hardware validation of the exact procedure is deferred to
-Phase D** (the DESIGN.md text below described this as already
-hardware-validated in the original plan -- that was aspirational/out of
-order; validation has not happened yet as of Phase C).
+The Phase C implementation guessed a "common PixArt pixel-grab convention"
+(write `PIXEL_GRAB` = 0x00, poll bit7) because only the 8-page public
+datasheet was available; Phase D hardware validation showed PG_Valid never
+asserts with that sequence. The full PMW3610 datasheet (R2.4, PIXEL_GRAB
+register usage section) documents the official `Pixel_Grab` procedure,
+which Phase D implemented and validated on hardware:
 
-Procedure (`pmw3610_capture_frame()` in `src/pmw3610.c`), matching
-`struct pmw3610_frame_capture_params` in
-`include/cormoran/pmw3610/pmw3610_api.h`:
+1. Write `0x41` = `0xBA` (SPI clock on request)
+2. Write `0x7F` = `0xFF` (select page 1)
+3. Write `0xB4` = `0xD7` (page-1 magic enable)
+4. Write `0x7F` = `0x00` (back to page 0)
+5. Write `0x41` = `0xB5` (SPI clock off)
+6. Write `0x32` = `0x90` (test clock on)
+7. Write `0x35` = `0x01` (arm pixel grab)
+8. Read `0x47` until bit1 set (else wait 10ms, re-check; bounded)
+9. Read `0x2D` until bit2 set (else wait 10ms, re-check; bounded)
+10. Read `0x35` → one raw byte (bit7 = PG_Valid, bits[6:0] = pixel)
+11. Write `0x2D` = `0x01` (advance to the next pixel)
+    — repeat 9-11 for the full frame (484 = 22x22, datasheet Figure 17)
+12. Read `0x47`; bit0 set = all 484 pixels read successfully (reported as
+    `complete` in the RPC response, along with the measured `duration_ms`)
 
-1. Require `data->ready` (else `-EBUSY`); take `data->lock`, set
-   `data->capture_active = true` (checked and short-circuited by
-   `pmw3610_report_data()`, which returns 0 without touching the sensor
-   while a capture is active -- belt-and-braces alongside disabling the
-   IRQ, since the trigger work item may already be queued when capture
-   starts), release the lock, then `pmw3610_set_interrupt(dev, false)`.
-2. If `write_pixel_grab_reset` (default true): write `PIXEL_GRAB` = 0x00.
-   If `write_frame_grab` (default false): write `FRAME_GRAB` =
-   `frame_grab_value` (default 0x00).
-3. Loop up to `pixel_count` times: read `PIXEL_GRAB`; bit7 = PG_VALID,
-   bits[6:0] = pixel value. Valid → store the **raw byte** (bit7 kept; the
-   host masks it) and advance; invalid → `k_busy_wait(20us)` and retry, up
-   to `max_invalid_retries` (default 300) *consecutive* invalid reads before
-   aborting early with whatever was collected. An unconditional wall-clock
-   deadline (`k_uptime_get()`-based, `PMW3610_FRAME_CAPTURE_TIMEOUT_MS` =
-   2000ms) bounds the entire loop regardless of the above, so the Studio RPC
-   thread can never be blocked indefinitely by a misbehaving sensor.
-4. Regardless of success/failure/timeout: re-take the lock, reset the async
-   init state machine to step 0 (`data->ready = false;
-   data->async_init_step = 0; data->async_init_retry_count = 0;
-   k_work_schedule(&data->init_work, ...)` -- exactly the not-ready path of
-   `pmw3610_resume()`), clear `capture_active`, release the lock. The motion
-   IRQ is re-enabled once async init reaches its last step (existing
-   `pmw3610_async_init()` behavior), not directly in this function.
+Driver-side wrapper behavior (`pmw3610_capture_frame()` in
+`src/pmw3610.c`), unchanged from Phase C where still applicable:
+
+- Require `data->ready` (else `-EBUSY`); take `data->lock`, set
+  `data->capture_active = true` (checked and short-circuited by
+  `pmw3610_report_data()`, belt-and-braces alongside disabling the IRQ),
+  release the lock, then `pmw3610_set_interrupt(dev, false)`.
+- The arm sequence (steps 1-7) uses **raw** `pmw3610_write_reg()` calls,
+  NOT the `pmw3610_write()` clk-on/off wrapper -- the datasheet sequence
+  manages the 0x41 SPI clock request itself (steps 1 and 5).
+- Per-pixel ready waits (steps 8/9) sleep 10ms per retry, bounded by
+  `max_invalid_retries` (reinterpreted in Phase D: number of 10ms wait
+  retries per pixel, default 3, clamped 1..100) and an unconditional
+  wall-clock deadline (`PMW3610_FRAME_CAPTURE_TIMEOUT_MS` = 5000ms), so
+  the Studio RPC thread can never be blocked indefinitely.
+- Raw bytes (bit7 kept) are stored; the host masks/interprets.
+- Regardless of success/failure/timeout: re-take the lock, reset the async
+  init state machine to step 0 (the datasheet requires a reset to resume
+  navigation after a pixel grab -- exactly the not-ready path of
+  `pmw3610_resume()`), reset `data->sw_smart_flag` (the capture wrote
+  `0x32`, which the smart-algorithm logic tracks via that flag; the
+  re-init's power-up reset clears the sensor-side register so the
+  host-side flag must follow), clear `capture_active`, release the lock.
+  The motion IRQ is re-enabled once async init reaches its last step.
 
 Pixel count is a request parameter (default 484 = 22x22, clamped to the
 firmware's static frame buffer, `CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE`).
-Raw register RPC (`ReadRegister`/`WriteRegister`) allows tuning the procedure
-without reflashing; all five knobs
-(`pixel_count`/`max_invalid_retries`/`write_frame_grab`/`frame_grab_value`/
-`skip_pixel_grab_reset` -- the last one inverted from the driver's
-`write_pixel_grab_reset` so the RPC default (`false`) matches "do the normal
-thing") are also exposed directly on `CaptureFrameRequest`.
+The Phase C procedure-tuning knobs (`write_frame_grab`/`frame_grab_value`/
+`skip_pixel_grab_reset`) were removed in Phase D (proto field numbers 4-6
+reserved) -- the official sequence is fixed by the datasheet and needs no
+tuning; only `pixel_count` and `max_invalid_retries` remain.
 
 ## RPC proto (`cormoran.pmw3610`)
 
@@ -288,10 +296,11 @@ Response = oneof { ErrorResponse, GetInfoResponse, ReadDiagnosticsResponse,
   the message text. Implemented in Phase B. **WriteRegister has no
   additional validation beyond fitting in a byte** -- it is a raw register
   write, documented as a debug facility in README.md.
-- `CaptureFrame{device_index, pixel_count, max_invalid_retries,
-  write_frame_grab, frame_grab_value, skip_pixel_grab_reset}` → captures into
-  a static buffer, returns `{frame_id, pixel_count, chunk_size}`. Implemented
-  in Phase C. `pixel_count` is clamped to
+- `CaptureFrame{device_index, pixel_count, max_invalid_retries}` → captures
+  into a static buffer, returns `{frame_id, pixel_count, chunk_size,
+  complete, duration_ms}`. Implemented in Phase C, procedure replaced with
+  the official datasheet sequence in Phase D (request fields 4-6, the old
+  procedure knobs, reserved). `pixel_count` is clamped to
   `CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE` (0 → driver default 484).
   `frame_id` is a monotonically increasing counter (starts at 1); errors
   (bad `device_index`, driver failure) produce an `ErrorResponse`, not a
@@ -331,9 +340,9 @@ Implemented in Phase C as four cards plus the connection card:
 - `FrameViewer.tsx`: size selector (19/20/21/22, default 22), device index
   input, capture-once button, start/stop streaming toggle (sequential
   capture loop, not a fixed-interval timer), advanced collapsible
-  (`write_frame_grab`, hex `frame_grab_value`, `skip_pixel_grab_reset`,
-  `max_invalid_retries`), canvas render (grayscale, 12px/sensor-pixel,
-  nearest-neighbor), invalid-byte-count warning, FPS counter.
+  (`max_invalid_retries` -- Phase D removed the obsolete procedure knobs),
+  canvas render (grayscale, 12px/sensor-pixel, nearest-neighbor),
+  complete/duration display, invalid-byte-count warning, FPS counter.
 - `frame.ts`: pure functions (`assembleFrame`, `chunkOffsets`,
   `pixelByteToGray`, `frameToRgba`, `isValidPixelByte`) extracted for unit
   testing without a canvas/DOM dependency.
@@ -386,15 +395,13 @@ Implemented in Phase C as four cards plus the connection card:
 5. Exercise `ReadDiagnostics`/`ReadRegister`/`WriteRegister` against a real
    device (index bounds, register 0x85 RES_STEP round trip, error path for
    an out-of-range device_index).
-6. `CaptureFrame` + `GetFrameChunk` (implemented in Phase C, **not yet
-   hardware-validated** -- this is the primary Phase D task) → assemble
-   image, verify plausible pixel data (covered sensor = dark, lit = bright);
-   tune procedure via the `CaptureFrameRequest` knobs
-   (`write_frame_grab`/`frame_grab_value`/`skip_pixel_grab_reset`/
-   `max_invalid_retries`) or raw register RPC if PG_VALID never asserts;
-   confirm the true usable array size (484 = 22x22 is an assumption, not yet
-   confirmed against real sensor output). Example CLI JSON request/response
-   shapes are in README.md's "Frame capture" section.
+6. `CaptureFrame` + `GetFrameChunk` (primary Phase D task -- done) →
+   Phase D found the Phase C guessed procedure never asserts PG_Valid;
+   replaced with the official datasheet (R2.4) Pixel_Grab sequence (see
+   "Frame capture" above) and validated on hardware: assembled frames,
+   checked `complete`/PG_Valid, confirmed the 484 = 22x22 array size
+   (datasheet Figure 17). Example CLI JSON request/response shapes are in
+   README.md's "Frame capture" section.
 7. Web UI smoke test (vite dev + Chrome WebSerial) if environment allows;
    otherwise CLI-driven equivalent via `custom-call`. In particular verify
    the Frame Viewer's streaming loop against real RPC round-trip latency

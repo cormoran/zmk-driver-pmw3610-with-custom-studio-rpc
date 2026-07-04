@@ -59,36 +59,43 @@ message WriteRegisterRequest {
 message WriteRegisterResponse {}
 
 // Captures a still frame (pixel array) from the sensor into a firmware-side
-// static buffer. The frame-grab procedure is not documented in the public
-// datasheet; the knobs below let the (hardware-validated in a later phase)
-// procedure be tuned without reflashing. Defaults match the common PixArt
-// pixel-grab convention.
+// static buffer, following the official PMW3610 datasheet (R2.4) Pixel_Grab
+// procedure: an arm sequence (SPI clock request + page-1 magic enable + test
+// clock on + PIXEL_GRAB arm), then per pixel: wait for OBSERVATION1 (0x2D)
+// bit2, read PIXEL_GRAB (0x35), write OBSERVATION1 = 0x01 to advance.
+// PRBS_TEST_CTL (0x47) bit0 at the end indicates a complete 484-pixel frame.
 message CaptureFrameRequest {
     uint32 device_index = 1;
-    // Number of pixels to read. 0 means the driver default (484 = 22x22).
-    // Clamped to the firmware's static frame buffer size
+    // Number of pixels to read. 0 means the driver default (484 = 22x22,
+    // the full array per the datasheet's pixel address map). Clamped to
+    // the firmware's static frame buffer size
     // (CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE).
     uint32 pixel_count = 2;
-    // Consecutive invalid-read retries allowed per pixel before the capture
-    // aborts (returning whatever was collected so far). 0 means the driver
-    // default (300).
+    // Max 10ms-wait retries per pixel while waiting for OBSERVATION1 bit2
+    // (pixel-ready) before the capture aborts, returning whatever was
+    // collected so far. 0 means the driver default (3); clamped to 1..100.
     uint32 max_invalid_retries = 3;
-    // Write FRAME_GRAB (0x36) = frame_grab_value before reading pixels.
-    bool write_frame_grab = 4;
-    uint32 frame_grab_value = 5;
-    // Skip writing PIXEL_GRAB (0x35) = 0x00 before reading (default is to
-    // write it, matching the driver's write_pixel_grab_reset default=true).
-    bool skip_pixel_grab_reset = 6;
+    // Former procedure-tuning knobs (write_frame_grab, frame_grab_value,
+    // skip_pixel_grab_reset) were removed when the official datasheet
+    // procedure replaced the guessed convention.
+    reserved 4, 5, 6;
 }
 
 message CaptureFrameResponse {
     uint32 frame_id = 1;
     // Number of pixel bytes actually collected (<= requested pixel_count;
-    // may be less if the capture aborted early on repeated invalid reads).
+    // may be less if the capture aborted early on repeated not-ready
+    // waits).
     uint32 pixel_count = 2;
     // Chunk size used by GetFrameChunk for this frame (fixed, currently
     // 128; see pmw3610.options for the actual bound).
     uint32 chunk_size = 3;
+    // PRBS_TEST_CTL (0x47) bit0 as read after the pixel loop: set when the
+    // sensor reports all 484 pixels were read successfully.
+    bool complete = 4;
+    // Wall-clock duration of the capture procedure (arm sequence through
+    // the completion check), in milliseconds.
+    uint32 duration_ms = 5;
 }
 
 // Fetch a chunk of a previously captured frame's pixel bytes.

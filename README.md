@@ -38,10 +38,9 @@ This module currently includes (Phase A + Phase B + Phase C):
   builds with custom settings enabled), and web unit tests (`web/test/`,
   including pure-function tests for frame chunk reassembly).
 
-Next (Phase D): hardware validation of the frame-capture procedure (see
-"Frame capture" below) — the exact PIXEL_GRAB/FRAME_GRAB sequence is not
-documented in the public datasheet and is tunable via `CaptureFrame`
-request parameters pending that validation.
+Phase D (hardware validation) is complete: the frame-capture procedure now
+follows the official PMW3610 datasheet (R2.4) `Pixel_Grab` sequence and has
+been validated against a real sensor (see "Frame capture" below).
 
 ## More Info
 
@@ -160,40 +159,41 @@ Notes:
 
 ### Frame capture (`CaptureFrame` / `GetFrameChunk`)
 
-The PMW3610 exposes `PIXEL_GRAB` (0x35) and `FRAME_GRAB` (0x36) registers,
-but the public 8-page datasheet does not document the procedure to read a
-still image. This module implements the common PixArt pixel-grab
-convention, with the variable points exposed as request parameters so the
-procedure can be tuned without reflashing — **hardware validation of this
-procedure is a follow-up phase (Phase D)**; treat captured frames with
-skepticism until then.
+Frame capture follows the official PMW3610 datasheet (R2.4) `Pixel_Grab`
+procedure: an arm sequence (SPI clock request on, page-1 magic enable,
+SPI clock request off, test clock on, `PIXEL_GRAB` (0x35) = 0x01), then per
+pixel: wait for `OBSERVATION1` (0x2D) bit2, read `PIXEL_GRAB`, write
+`OBSERVATION1` = 0x01 to advance. `PRBS_TEST_CTL` (0x47) bit0 afterwards
+reports whether the sensor considers all 484 pixels read. The full pixel
+array is 22x22 = 484 pixels (datasheet Figure 17).
 
-- `CaptureFrame{device_index, pixel_count, max_invalid_retries,
-  write_frame_grab, frame_grab_value, skip_pixel_grab_reset}` → captures into
-  a firmware-side static buffer (size
+- `CaptureFrame{device_index, pixel_count, max_invalid_retries}` → captures
+  into a firmware-side static buffer (size
   `CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE`, default 484 = 22x22) and
-  returns `{frame_id, pixel_count, chunk_size}`. `pixel_count` is clamped to
-  the buffer size; 0 uses the driver default (484). All non-pixel_count
-  numeric fields being 0/false select the driver's defaults
-  (`max_invalid_retries` 300, no `FRAME_GRAB` write,
-  `skip_pixel_grab_reset=false` i.e. reset **is** written).
+  returns `{frame_id, pixel_count, chunk_size, complete, duration_ms}`.
+  `pixel_count` is clamped to the buffer size; 0 uses the driver default
+  (484). `max_invalid_retries` is the per-pixel budget of 10ms
+  ready-bit-wait retries (0 = driver default 3, clamped to 1..100).
+  `complete` mirrors the sensor's own all-484-pixels-read status bit;
+  `duration_ms` is the wall-clock capture duration.
 - `GetFrameChunk{frame_id, offset}` → `{frame_id, offset, bytes data}`, up to
   128 bytes per call. Call it repeatedly with increasing offsets (0, 128,
   256, ...) until `offset + data.size >= pixel_count` to assemble the full
   frame; `frame_id` must match the most recent `CaptureFrame` response or the
   call fails.
-- Each raw byte's bit7 is `PG_VALID` (bits[6:0] are the pixel value); the
+- Each raw byte's bit7 is `PG_Valid` (bits[6:0] are the pixel value); the
   firmware stores the byte as-is (does not mask it) so the host can inspect
   capture quality. The web UI masks bit7 for display and separately counts
   invalid bytes as a warning.
 - During capture: the motion IRQ is disabled and an internal flag makes the
   normal motion-report path a no-op, so capturing a frame does not interleave
-  with mouse movement reporting. Capture disturbs the sensor's navigation
-  state, so on return (success **or** failure) the driver always re-runs the
-  power-up-reset + reconfigure flow (same as `pmw3610_resume()`'s not-ready
-  path) before returning, and the whole read loop is bounded to ~2 seconds of
-  wall-clock time regardless of `pixel_count`/`max_invalid_retries`, so a
-  misbehaving sensor cannot hang the Studio RPC thread.
+  with mouse movement reporting. The datasheet requires a reset to resume
+  navigation after a pixel grab, so on return (success **or** failure) the
+  driver always re-runs the power-up-reset + reconfigure flow (same as
+  `pmw3610_resume()`'s not-ready path) before returning, and the whole
+  procedure is bounded to ~5 seconds of wall-clock time regardless of
+  `pixel_count`/`max_invalid_retries`, so a misbehaving sensor cannot hang
+  the Studio RPC thread. (A typical complete capture is far faster.)
 - A 128-byte `GetFrameChunk` data chunk plus proto framing overhead must fit
   in one `CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE` (256 in this module's test
   config) — a `BUILD_ASSERT` in `src/studio/pmw3610_handler.c` catches a
@@ -207,9 +207,10 @@ Example raw request/response JSON shapes for CLI tools (e.g.
 for the exact field numbers:
 
 ```jsonc
-// CaptureFrame request (defaults: 22x22, standard procedure)
+// CaptureFrame request (defaults: full 22x22 frame)
 { "captureFrame": { "deviceIndex": 0, "pixelCount": 484 } }
-// -> { "captureFrame": { "frameId": 1, "pixelCount": 484, "chunkSize": 128 } }
+// -> { "captureFrame": { "frameId": 1, "pixelCount": 484, "chunkSize": 128,
+//      "complete": true, "durationMs": 480 } }
 
 // GetFrameChunk request (repeat with offset 0, 128, 256, 384)
 { "getFrameChunk": { "frameId": 1, "offset": 0 } }

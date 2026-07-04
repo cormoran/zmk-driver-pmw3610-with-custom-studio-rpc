@@ -19,16 +19,10 @@ const PIXEL_SCALE = 12; // px per sensor pixel on <canvas>
 const STREAM_LOOP_DELAY_MS = 10; // small yield between captures while streaming
 
 interface AdvancedOptions {
-  writeFrameGrab: boolean;
-  frameGrabValueHex: string;
-  skipPixelGrabReset: boolean;
   maxInvalidRetries: string;
 }
 
 const DEFAULT_ADVANCED: AdvancedOptions = {
-  writeFrameGrab: false,
-  frameGrabValueHex: "00",
-  skipPixelGrabReset: false,
   maxInvalidRetries: "",
 };
 
@@ -44,6 +38,8 @@ export function FrameViewer() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [invalidCount, setInvalidCount] = useState<number | null>(null);
   const [pixelCount, setPixelCount] = useState<number | null>(null);
+  const [complete, setComplete] = useState<boolean | null>(null);
+  const [durationMs, setDurationMs] = useState<number | null>(null);
   const [fps, setFps] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -76,10 +72,6 @@ export function FrameViewer() {
           maxInvalidRetries: advanced.maxInvalidRetries
             ? Number.parseInt(advanced.maxInvalidRetries, 10)
             : 0,
-          writeFrameGrab: advanced.writeFrameGrab,
-          frameGrabValue:
-            Number.parseInt(advanced.frameGrabValueHex || "0", 16) || 0,
-          skipPixelGrabReset: advanced.skipPixelGrabReset,
         },
       })
     );
@@ -115,6 +107,8 @@ export function FrameViewer() {
     renderFrame(assembled.bytes, side);
     setInvalidCount(assembled.invalidCount);
     setPixelCount(totalLength);
+    setComplete(captureFrame.complete);
+    setDurationMs(captureFrame.durationMs);
   };
 
   const renderFrame = (bytes: Uint8Array, sideLength: number) => {
@@ -242,9 +236,9 @@ export function FrameViewer() {
     <section className="card">
       <h2>Frame Viewer</h2>
       <p>
-        Captures a still image from the sensor. The frame-grab procedure is not
-        documented in the public datasheet -- if the image looks wrong, try the
-        advanced tuning knobs below.
+        Captures a still image from the sensor using the official PMW3610
+        Pixel_Grab procedure (full array is 22 x 22). Capturing briefly
+        interrupts mouse motion while the sensor resets afterwards.
       </p>
 
       <div className="form-grid">
@@ -301,50 +295,21 @@ export function FrameViewer() {
         open={showAdvanced}
         onToggle={(e) => setShowAdvanced((e.target as HTMLDetailsElement).open)}
       >
-        <summary>Advanced (capture procedure tuning)</summary>
+        <summary>Advanced (capture tuning)</summary>
         <div className="form-grid">
-          <label htmlFor="write-frame-grab">Write FRAME_GRAB before read</label>
-          <input
-            id="write-frame-grab"
-            type="checkbox"
-            checked={advanced.writeFrameGrab}
-            onChange={(e) =>
-              setAdvanced({ ...advanced, writeFrameGrab: e.target.checked })
-            }
-          />
-
-          <label htmlFor="frame-grab-value">FRAME_GRAB value (hex)</label>
-          <input
-            id="frame-grab-value"
-            value={advanced.frameGrabValueHex}
-            onChange={(e) =>
-              setAdvanced({ ...advanced, frameGrabValueHex: e.target.value })
-            }
-            disabled={!advanced.writeFrameGrab}
-          />
-
-          <label htmlFor="skip-pixel-grab-reset">Skip PIXEL_GRAB reset</label>
-          <input
-            id="skip-pixel-grab-reset"
-            type="checkbox"
-            checked={advanced.skipPixelGrabReset}
-            onChange={(e) =>
-              setAdvanced({ ...advanced, skipPixelGrabReset: e.target.checked })
-            }
-          />
-
           <label htmlFor="max-invalid-retries">
-            Max invalid retries (0 = default)
+            Per-pixel ready-wait retries, 10ms each (0 = default)
           </label>
           <input
             id="max-invalid-retries"
             type="number"
             min={0}
+            max={100}
             value={advanced.maxInvalidRetries}
             onChange={(e) =>
               setAdvanced({ ...advanced, maxInvalidRetries: e.target.value })
             }
-            placeholder="300"
+            placeholder="3"
           />
         </div>
       </details>
@@ -365,11 +330,24 @@ export function FrameViewer() {
           <dd>{pixelCount ?? "-"}</dd>
         </div>
         <div>
+          <dt>Complete</dt>
+          <dd>
+            {complete === null ? "-" : complete ? "yes" : "no"}
+            {complete === false && (
+              <span className="warning-inline"> (sensor: not all 484)</span>
+            )}
+          </dd>
+        </div>
+        <div>
+          <dt>Capture time</dt>
+          <dd>{durationMs !== null ? `${durationMs} ms` : "-"}</dd>
+        </div>
+        <div>
           <dt>Invalid bytes</dt>
           <dd>
             {invalidCount ?? "-"}
             {invalidCount !== null && invalidCount > 0 && (
-              <span className="warning-inline"> (PG_VALID clear)</span>
+              <span className="warning-inline"> (PG_Valid clear)</span>
             )}
           </dd>
         </div>

@@ -229,26 +229,27 @@ static void handle_capture_frame_request(const cormoran_pmw3610_CaptureFrameRequ
     struct pmw3610_frame_capture_params params = {
         .pixel_count =
             (uint16_t)MIN(req->pixel_count, (uint32_t)CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE),
+        /* Per-pixel 10ms-wait retry budget; the driver clamps to its own
+         * 1..100 range (0 = driver default). */
         .max_invalid_retries = (uint16_t)MIN(req->max_invalid_retries, (uint32_t)UINT16_MAX),
-        .write_frame_grab = req->write_frame_grab,
-        .frame_grab_value = (uint8_t)MIN(req->frame_grab_value, (uint32_t)0xFF),
-        .write_pixel_grab_reset = !req->skip_pixel_grab_reset,
     };
 
-    uint16_t out_count = 0;
-    int err = pmw3610_capture_frame(dev, &params, frame_buf, sizeof(frame_buf), &out_count);
+    struct pmw3610_frame_capture_result capture = {0};
+    int err = pmw3610_capture_frame(dev, &params, frame_buf, sizeof(frame_buf), &capture);
     if (err) {
         set_error(resp, "CaptureFrame failed: errno %d", err);
         return;
     }
 
     frame_id++;
-    frame_len = out_count;
+    frame_len = capture.pixel_count;
 
     cormoran_pmw3610_CaptureFrameResponse result = cormoran_pmw3610_CaptureFrameResponse_init_zero;
     result.frame_id = frame_id;
-    result.pixel_count = out_count;
+    result.pixel_count = capture.pixel_count;
     result.chunk_size = PMW3610_FRAME_CHUNK_SIZE;
+    result.complete = capture.complete;
+    result.duration_ms = capture.duration_ms;
 
     resp->which_response_type = cormoran_pmw3610_Response_capture_frame_tag;
     resp->response_type.capture_frame = result;

@@ -125,13 +125,13 @@ int pmw3610_set_report_interval_min(const struct device *dev, uint32_t value_ms)
 
 int pmw3610_capture_frame(const struct device *dev,
                           const struct pmw3610_frame_capture_params *params, uint8_t *buf,
-                          uint16_t buf_len, uint16_t *out_count) {
+                          uint16_t buf_len, struct pmw3610_frame_capture_result *result) {
     ARG_UNUSED(dev);
     ARG_UNUSED(params);
     ARG_UNUSED(buf);
     ARG_UNUSED(buf_len);
-    if (out_count) {
-        *out_count = 0;
+    if (result) {
+        *result = (struct pmw3610_frame_capture_result){0};
     }
     return -ENODEV;
 }
