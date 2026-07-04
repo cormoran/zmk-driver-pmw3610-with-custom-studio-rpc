@@ -1,0 +1,5 @@
+# Nanopb options file for pmw3610.proto
+# This defines max sizes for string fields and max counts for repeated fields
+
+cormoran.pmw3610.ErrorResponse.message        max_size:64
+cormoran.pmw3610.GetInfoResponse.devices      max_count:2

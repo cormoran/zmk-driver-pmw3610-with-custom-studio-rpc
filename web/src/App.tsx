@@ -6,15 +6,15 @@ import {
   ZMKCustomSubsystem,
   ZMKAppContext,
 } from "@cormoran/zmk-studio-react-hook";
-import { Request, Response } from "./proto/your-name/template/template";
+import { Request, Response } from "./proto/cormoran/pmw3610/pmw3610";
 
-export const SUBSYSTEM_IDENTIFIER = "your_name__template";
+export const SUBSYSTEM_IDENTIFIER = "cormoran__pmw3610";
 
 function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>🔧 ZMK Module Template</h1>
+        <h1>🖱️ PMW3610 Trackball</h1>
         <p>Custom Studio RPC Demo</p>
       </header>
 
@@ -57,7 +57,8 @@ function App() {
 
       <footer className="app-footer">
         <p>
-          <strong>Template Module</strong> - Customize this for your ZMK module
+          <strong>PMW3610 Module</strong> - Sensor diagnostics over custom
+          Studio RPC
         </p>
       </footer>
     </div>
@@ -66,7 +67,6 @@ function App() {
 
 export function RPCTestSection() {
   const zmkApp = useContext(ZMKAppContext);
-  const [inputValue, setInputValue] = useState<number>(42);
   const [response, setResponse] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -74,7 +74,7 @@ export function RPCTestSection() {
 
   const subsystem = zmkApp.findSubsystem(SUBSYSTEM_IDENTIFIER);
 
-  const sendSampleRequest = async () => {
+  const sendGetInfoRequest = async () => {
     if (!zmkApp.state.connection || !subsystem) return;
 
     setIsLoading(true);
@@ -87,9 +87,7 @@ export function RPCTestSection() {
       );
 
       const request = Request.create({
-        sample: {
-          value: inputValue,
-        },
+        getInfo: {},
       });
 
       const payload = Request.encode(request).finish();
@@ -99,8 +97,8 @@ export function RPCTestSection() {
         const resp = Response.decode(responsePayload);
         console.log("Decoded response:", resp);
 
-        if (resp.sample) {
-          setResponse(resp.sample.value);
+        if (resp.getInfo) {
+          setResponse(JSON.stringify(resp.getInfo, null, 2));
         } else if (resp.error) {
           setResponse(`Error: ${resp.error.message}`);
         }
@@ -121,7 +119,7 @@ export function RPCTestSection() {
         <div className="warning-message">
           <p>
             ⚠️ Subsystem "{SUBSYSTEM_IDENTIFIER}" not found. Make sure your
-            firmware includes the template module.
+            firmware includes the PMW3610 module.
           </p>
         </div>
       </section>
@@ -130,25 +128,15 @@ export function RPCTestSection() {
 
   return (
     <section className="card">
-      <h2>RPC Test</h2>
-      <p>Send a sample request to the firmware:</p>
-
-      <div className="input-group">
-        <label htmlFor="value-input">Value:</label>
-        <input
-          id="value-input"
-          type="number"
-          value={inputValue}
-          onChange={(e) => setInputValue(parseInt(e.target.value) || 0)}
-        />
-      </div>
+      <h2>Sensor Info</h2>
+      <p>Query PMW3610 device info from the firmware:</p>
 
       <button
         className="btn btn-primary"
         disabled={isLoading}
-        onClick={sendSampleRequest}
+        onClick={sendGetInfoRequest}
       >
-        {isLoading ? "⏳ Sending..." : "📤 Send Request"}
+        {isLoading ? "⏳ Loading..." : "📤 Get Info"}
       </button>
 
       {response && (

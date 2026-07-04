@@ -19,25 +19,11 @@ describe("RPCTestSection Component", () => {
         </ZMKAppProvider>
       );
 
-      expect(screen.getByText(/RPC Test/i)).toBeInTheDocument();
-      expect(screen.getByText(/Send a sample request/i)).toBeInTheDocument();
-      expect(screen.getByLabelText(/Value:/i)).toBeInTheDocument();
-      expect(screen.getByText(/Send Request/i)).toBeInTheDocument();
-    });
-
-    it("should show default input value", () => {
-      const mockZMKApp = createConnectedMockZMKApp({
-        subsystems: [SUBSYSTEM_IDENTIFIER],
-      });
-
-      render(
-        <ZMKAppProvider value={mockZMKApp}>
-          <RPCTestSection />
-        </ZMKAppProvider>
-      );
-
-      const input = screen.getByLabelText(/Value:/i) as HTMLInputElement;
-      expect(input.value).toBe("42");
+      expect(screen.getByText(/Sensor Info/i)).toBeInTheDocument();
+      expect(
+        screen.getByText(/Query PMW3610 device info/i)
+      ).toBeInTheDocument();
+      expect(screen.getByText(/Get Info/i)).toBeInTheDocument();
     });
   });
 
@@ -55,12 +41,10 @@ describe("RPCTestSection Component", () => {
       );
 
       expect(
-        screen.getByText(/Subsystem "your_name__template" not found/i)
+        screen.getByText(/Subsystem "cormoran__pmw3610" not found/i)
       ).toBeInTheDocument();
       expect(
-        screen.getByText(
-          /Make sure your firmware includes the template module/i
-        )
+        screen.getByText(/Make sure your firmware includes the PMW3610 module/i)
       ).toBeInTheDocument();
     });
   });

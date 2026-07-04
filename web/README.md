@@ -1,12 +1,12 @@
-# ZMK Module Template - Web Frontend
+# PMW3610 Module - Web Frontend
 
-This is a minimal web application template for interacting with ZMK firmware
-modules that implement custom Studio RPC subsystems.
+This is a web application for interacting with the PMW3610 ZMK module's
+custom Studio RPC subsystem.
 
 ## Features
 
 - **Device Connection**: Connect to ZMK devices via Bluetooth (GATT) or Serial
-- **Custom RPC**: Communicate with your custom firmware module using protobuf
+- **Custom RPC**: Communicate with the PMW3610 firmware module using protobuf
 - **React + TypeScript**: Modern web development with Vite for fast builds
 - **react-zmk-studio**: Uses the `@cormoran/zmk-studio-react-hook` library for
   simplified ZMK integration
@@ -38,8 +38,8 @@ src/
 ├── App.tsx               # Main application with connection UI
 ├── App.css               # Styles
 └── proto/                # Generated protobuf TypeScript types
-    └── your-name/template/
-        └── template.ts
+    └── cormoran/pmw3610/
+        └── pmw3610.ts
 
 test/
 ├── App.spec.tsx              # Tests for App component
@@ -50,7 +50,7 @@ test/
 
 ### 1. Protocol Definition
 
-The protobuf schema is defined in `../proto/your-name/template/template.proto`.
+The protobuf schema is defined in `../proto/cormoran/pmw3610/pmw3610.proto`.
 
 ### 2. Code Generation
 
@@ -72,8 +72,8 @@ import { useZMKApp, ZMKCustomSubsystem } from "@cormoran/zmk-studio-react-hook";
 // Connect to device
 const { state, connect, findSubsystem, isConnected } = useZMKApp();
 
-// Find your subsystem
-const subsystem = findSubsystem("your_name__template");
+// Find the PMW3610 subsystem
+const subsystem = findSubsystem("cormoran__pmw3610");
 
 // Create service and make RPC calls
 const service = new ZMKCustomSubsystem(state.connection, subsystem.index);
@@ -105,7 +105,7 @@ import {
 
 const mockZMKApp = createConnectedMockZMKApp({
   deviceName: "Test Device",
-  subsystems: ["your_name__template"],
+  subsystems: ["cormoran__pmw3610"],
 });
 
 render(
@@ -115,15 +115,8 @@ render(
 );
 ```
 
-## Customization
+## Roadmap
 
-To adapt this template for your own ZMK module:
-
-1. **Update the proto file**: Modify `../proto/your-name/template/template.proto` with
-   your message types
-2. **Regenerate types**: Run `npm run generate`
-3. **Update subsystem identifier**: Change `SUBSYSTEM_IDENTIFIER` in `App.tsx`
-   to match your firmware registration
-4. **Update RPC logic**: Modify the request/response handling in `App.tsx`
-5. **Update tests**: Modify tests to match your custom subsystem identifier and
-   functionality
+This UI currently only exposes `GetInfo` diagnostics. Planned additions:
+runtime settings panel (CPI, downshift/sample timings, etc. via
+zmk-feature-custom-settings) and a frame (image) capture viewer.

@@ -1,22 +1,36 @@
-# cormoran's ZMK Module Template for ZMK (with Custom Studio RPC)
+# zmk-driver-pmw3610-with-custom-studio-rpc
 
 ![ZMK Version](https://img.shields.io/badge/ZMK-master-blue)
 [![Test](https://github.com/cormoran/zmk-module-template/actions/workflows/zmk-module.yml/badge.svg?branch=main)](https://github.com/cormoran/zmk-module-template/actions/workflows/zmk-module.yml) [![Devcontainer](https://github.com/cormoran/zmk-module-template/actions/workflows/devcontainer.yml/badge.svg?branch=main)](https://github.com/cormoran/zmk-module-template/actions/workflows/devcontainer.yml)
 
-This repository contains a template for a ZMK module with Web UI using the **unofficial** custom ZMK Studio RPC protocol.
+ZMK module providing the [PMW3610](https://github.com/cormoran/zmk-pmw3610-driver)
+optical mouse sensor driver, with a Web UI and an **unofficial** custom ZMK
+Studio RPC protocol for diagnostics (and, in later phases, runtime settings
+and frame capture).
 
-It's extended from ZMK official template with [zmk-west-commands](https://github.com/cormoran/zmk-west-commands), test code template, coding agent support, and custom Studio RPC protocol support.
+This is a drop-in replacement for `cormoran/zmk-pmw3610-driver` (same
+devicetree compatible `cormoran,pmw3610`) — do not use both modules together.
+
+See [DESIGN.md](./DESIGN.md) for the full module design and roadmap. This
+module is under active development; the sections below will be filled in as
+features land.
 
 ## Summary
 
-This template includes:
+This module currently includes (Phase A):
 
-- **Firmware**: Sample custom Studio RPC handler (`src/studio/template_handler.c`)
-- **Protocol**: Protobuf definition (`proto/your-name/template/template.proto`)
-- **Web UI**: React + TypeScript app (`web/`) using [@cormoran/zmk-studio-react-hook](https://github.com/cormoran/react-zmk-studio)
-- **Tests**: Firmware unit tests (`tests/studio/`) and build tests (`tests/zmk-config/`)
+- **Firmware**: PMW3610 sensor driver (`src/pmw3610.c`) and a minimal custom
+  Studio RPC handler (`src/studio/pmw3610_handler.c`) exposing sensor
+  presence/diagnostics via `GetInfo`.
+- **Protocol**: Protobuf definition (`proto/cormoran/pmw3610/pmw3610.proto`)
+- **Web UI**: React + TypeScript app (`web/`) using
+  [@cormoran/zmk-studio-react-hook](https://github.com/cormoran/react-zmk-studio)
+- **Tests**: Firmware unit tests (`tests/studio/`) and build tests
+  (`tests/zmk-config/`)
 
-Read through the [ZMK Module Creation](https://zmk.dev/docs/development/module-creation) page for details on how to configure this template.
+Planned next: runtime-configurable settings via
+[zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings),
+raw register access, frame (image) capture streaming, and a full web UI.
 
 ## More Info
 
@@ -34,7 +48,7 @@ For more info on modules, you can read through through the [Zephyr modules page]
            url-base: https://github.com/cormoran
        projects:
            ...
-           - name: zmk-module-template
+           - name: zmk-driver-pmw3610-with-custom-studio-rpc
            remote: cormoran
            revision: main+custom-studio-protocol # or latest commit hash
            import: true
@@ -47,23 +61,24 @@ For more info on modules, you can read through through the [Zephyr modules page]
                file: app/west.yml
    ```
 
-2. Enable flags in your `config/<shield>.conf`
+2. Add the sensor to your board/shield overlay (see
+   `tests/zmk-config/snippets/pmw3610-trackball/pmw3610-trackball.overlay` for
+   a full example) and enable the driver in your `config/<shield>.conf`:
 
    ```conf
-   CONFIG_ZMK_TEMPLATE_FEATURE=y
+   CONFIG_PMW3610=y
+   CONFIG_INPUT=y
+   CONFIG_ZMK_POINTING=y
 
-   # Optionally enable custom Studio RPC
+   # Optionally enable custom Studio RPC diagnostics
    CONFIG_ZMK_STUDIO=y
-   CONFIG_ZMK_TEMPLATE_FEATURE_STUDIO_RPC=y
-   CONFIG_ZMK_CUSTOM_SETTINGS=y
-   CONFIG_ZMK_CUSTOM_SETTINGS_STUDIO_RPC=y
-   CONFIG_ZMK_STUDIO_RPC_RX_BUF_SIZE=128
-   CONFIG_ZMK_LOW_PRIORITY_THREAD_STACK_SIZE=2048
+   CONFIG_ZMK_PMW3610_STUDIO_RPC=y
+   CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE=256
    ```
 
-3. Implement your custom protocol by editing:
-   - `proto/your-name/template/template.proto` — message types
-   - `src/studio/template_handler.c` — firmware RPC handler
+3. Explore the protocol / firmware handler / web UI:
+   - `proto/cormoran/pmw3610/pmw3610.proto` — message types
+   - `src/studio/pmw3610_handler.c` — firmware RPC handler
    - `web/src/App.tsx` — web UI
 
 ### Web UI

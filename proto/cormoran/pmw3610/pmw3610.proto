@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package cormoran.pmw3610;
+
+message GetInfoRequest {}
+
+message DeviceInfo {
+    bool ready = 1;
+    uint32 product_id = 2;
+    uint32 revision_id = 3;
+    int32 init_error = 4;
+}
+
+message GetInfoResponse { repeated DeviceInfo devices = 1; }
+
+message Request {
+    oneof request_type { GetInfoRequest get_info = 1; }
+}
+
+message ErrorResponse { string message = 1; }
+
+message Response {
+    oneof response_type {
+        ErrorResponse error = 1;
+        GetInfoResponse get_info = 2;
+    }
+}
