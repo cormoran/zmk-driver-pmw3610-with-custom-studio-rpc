@@ -384,12 +384,22 @@ Implemented in Phase C as four cards plus the connection card:
   fails before any lock notification was observed (e.g. immediately after
   reconnecting to an already-locked device).
 - Proto vendoring: `web/buf.gen.yaml` lists a *second* `buf generate` input
-  directory pointing directly at
-  `../dependencies/zmk-feature-custom-settings/proto` (not vendored into
-  this repo's own `proto/` tree, which would make the firmware-side nanopb
-  glob in `CMakeLists.txt` pick it up too and generate a conflicting second
-  copy of the `cormoran.zmk.custom_settings` package, failing to link into
-  the `pmw3610_settings_rpc` test artifact that includes both modules).
+  directory, `web/proto/`, containing a vendored copy of
+  zmk-feature-custom-settings' `custom_settings.proto` (see the
+  provenance/re-sync comment at the top of that file for the pinned commit
+  and how to refresh it). This is **not** the repo-root `proto/` tree used by
+  the firmware-side nanopb glob in `CMakeLists.txt` — vendoring under
+  `web/proto/` instead avoids a conflicting second copy of the
+  `cormoran.zmk.custom_settings` package in firmware builds that include
+  both modules (e.g. `pmw3610_settings_rpc`).
+  Originally this pointed straight at
+  `../dependencies/zmk-feature-custom-settings/proto` (the west dependency
+  checkout) instead of vendoring, which worked locally but broke CI:
+  `web-ui.yml` builds `web/` standalone with plain `npm ci` and never runs
+  `west update`, so that path doesn't exist there
+  (`stat ../dependencies/zmk-feature-custom-settings/proto: no such file or
+  directory`). Vendoring fixes this at the cost of manual re-sync when the
+  dependency's proto changes.
 
 ## Test config (tests/zmk-config)
 

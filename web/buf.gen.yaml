@@ -1,14 +1,16 @@
 version: v2
 inputs:
   - directory: ../proto
-  # zmk-feature-custom-settings' custom_settings.proto, generated straight
-  # from the west dependency checkout (not vendored into this repo's own
-  # proto/ tree) so it is NOT picked up by this module's firmware-side
-  # nanopb glob (CMakeLists.txt: proto/*.proto) -- that would generate a
-  # second, conflicting copy of the cormoran.zmk.custom_settings package
-  # and fail to link into any build that includes both modules (e.g. the
-  # pmw3610_settings_rpc test artifact).
-  - directory: ../dependencies/zmk-feature-custom-settings/proto
+  # zmk-feature-custom-settings' custom_settings.proto, vendored into
+  # web/proto/ (see the provenance/re-sync comment at the top of that file)
+  # rather than read from ../dependencies/zmk-feature-custom-settings/proto.
+  # The web-ui.yml CI workflow builds web/ standalone with plain `npm ci` --
+  # it never runs `west update`, so a path outside this repo is not
+  # available there. web/proto/ is a separate tree from the repo-root
+  # proto/ used by CMakeLists.txt's firmware-side nanopb glob, so vendoring
+  # it here does not create a second, conflicting copy for the firmware
+  # build.
+  - directory: proto
 plugins:
   - local: protoc-gen-ts_proto
     opt:
