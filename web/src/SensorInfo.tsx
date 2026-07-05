@@ -9,6 +9,7 @@ import {
   Request,
   Response,
 } from "./proto/cormoran/pmw3610/pmw3610";
+import { callPmw3610Request, PeripheralResponseCorrelator } from "./relay";
 
 export const PMW3610_SUBSYSTEM_IDENTIFIER = "cormoran__pmw3610";
 export const PMW3610_PRODUCT_ID = 0x3e;
@@ -20,11 +21,16 @@ export function SensorInfo() {
 
   const [devices, setDevices] = useState<DeviceInfo[]>([]);
   const [selectedDevice, setSelectedDevice] = useState(0);
+  // 0 = this device's own local PMW3610s; 1+ = a split peripheral's, relayed
+  // asynchronously (see DESIGN.md Phase F / web/src/relay.ts).
+  const [source, setSource] = useState(0);
   const [diagnostics, setDiagnostics] =
     useState<ReadDiagnosticsResponse | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+
+  const correlatorRef = useRef(new PeripheralResponseCorrelator());
 
   const callRequest = async (request: Request): Promise<Response> => {
     const connection = zmkApp?.state.connection;
@@ -33,18 +39,14 @@ export function SensorInfo() {
     }
     const service = new ZMKCustomSubsystem(connection, subsystem.index);
     const payload = Request.encode(request).finish();
-    const responsePayload = await service.callRPC(payload);
-    if (!responsePayload) {
-      throw new Error("Empty response");
-    }
-    return Response.decode(responsePayload);
+    return callPmw3610Request(service, payload, correlatorRef.current);
   };
 
   const refreshInfo = async () => {
     setIsLoading(true);
     setError(null);
     try {
-      const resp = await callRequest(Request.create({ getInfo: {} }));
+      const resp = await callRequest(Request.create({ getInfo: { source } }));
       if (resp.error) {
         throw new Error(resp.error.message);
       }
@@ -59,7 +61,9 @@ export function SensorInfo() {
   const refreshDiagnostics = async () => {
     try {
       const resp = await callRequest(
-        Request.create({ readDiagnostics: { deviceIndex: selectedDevice } })
+        Request.create({
+          readDiagnostics: { deviceIndex: selectedDevice, source },
+        })
       );
       if (resp.error) {
         throw new Error(resp.error.message);
@@ -72,6 +76,25 @@ export function SensorInfo() {
     }
   };
 
+  // Relayed (source != 0) requests answer asynchronously as a
+  // PeripheralResponse Studio notification -- feed every notification to
+  // the correlator so callPmw3610Request()'s pending promise resolves.
+  useEffect(() => {
+    if (!zmkApp || !subsystem) return;
+    const correlator = correlatorRef.current;
+    const unsubscribe = zmkApp.onNotification({
+      type: "custom",
+      subsystemIndex: subsystem.index,
+      callback: (notification) =>
+        correlator.handleNotificationPayload(notification.payload),
+    });
+    return () => {
+      unsubscribe();
+      correlator.clear("Subsystem changed or component unmounted");
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zmkApp, subsystem?.index]);
+
   useEffect(() => {
     if (subsystem) {
       // Fire-and-forget: refreshInfo manages its own loading/error state
@@ -82,9 +105,10 @@ export function SensorInfo() {
       // eslint-disable-next-line react-hooks/set-state-in-effect
       void refreshInfo();
     }
-    // Load once when the subsystem becomes available.
+    // Reload when the subsystem becomes available or the target source
+    // changes (switching which half's devices are shown).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subsystem?.index]);
+  }, [subsystem?.index, source]);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   useEffect(() => {
@@ -99,7 +123,7 @@ export function SensorInfo() {
     }
     // Only depends on the toggle/device/subsystem, not the callback identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefresh, selectedDevice, subsystem?.index]);
+  }, [autoRefresh, selectedDevice, source, subsystem?.index]);
 
   if (!zmkApp) return null;
 
@@ -132,6 +156,17 @@ export function SensorInfo() {
           >
             {isLoading ? "Loading..." : "Refresh"}
           </button>
+          <label htmlFor="source-input" className="inline-label">
+            Split source
+          </label>
+          <input
+            id="source-input"
+            type="number"
+            min={0}
+            value={source}
+            onChange={(e) => setSource(Number(e.target.value))}
+            title="0 = this device's own sensors; 1+ = a split peripheral's, relayed asynchronously"
+          />
           {devices.length > 1 && (
             <>
               <label htmlFor="device-select" className="inline-label">

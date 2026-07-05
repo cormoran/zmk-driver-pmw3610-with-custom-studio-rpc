@@ -389,9 +389,14 @@ this feature.
 ### Web UI
 
 See [web/README.md](./web/README.md) for web UI development instructions,
-including the settings panel, diagnostics polling, and frame viewer. The web
-UI does not yet have controls for the split `source` field above (Studio
-calls from the current UI always target `source: 0`, i.e. local devices).
+including the settings panel, diagnostics polling, and frame viewer. The
+Sensor and Frame Viewer cards each have a "Split source" input (0 = local,
+matching the proto default); a relayed request's `DeferredResponse` is
+awaited transparently behind the scenes (`web/src/relay.ts`) so the rest of
+the UI code doesn't need to special-case it. The generic settings panel
+(`cormoran_custom_settings`, a separate subsystem provided by
+zmk-feature-custom-settings) does not have a source selector yet -- its
+calls always target `source: 0` (local devices).
 
 ### Publishing Web UI
 

@@ -649,25 +649,59 @@ Everything below was design; implementation status per stage (F.6):
   `GetInfoResponse`, ~231 bytes) needed
   `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` raised from 224 to 240 (still
   comfortably under the 255-byte hard ceiling).
-- **F-e (web UI plumbing for `source`) — not yet implemented.** The web UI
-  still always calls with `source: 0` (local devices only); adding a
-  device/source selector, the async deferred-response correlation helper,
-  and per-source frame stream demuxing described in F.4 below is left for
-  later.
+- **F-e (web UI plumbing for `source`, pmw3610 subsystem) — implemented.**
+  `web/src/relay.ts` (new, pure/unit-tested):
+  `PeripheralResponseCorrelator` tracks relayed requests by `request_id`
+  (assigned by the firmware, globally unique, so one correlator instance is
+  safe to share across concurrent callers), resolving/rejecting (6s
+  timeout, comfortably above the firmware's ~5s frame-capture deadline)
+  when fed a matching `PeripheralResponse` notification payload; and
+  `callPmw3610Request()` wraps a raw RPC call, transparently awaiting the
+  correlation when the immediate reply is a `DeferredResponse`, so callers
+  don't need to special-case relayed vs. local requests. `SensorInfo.tsx`
+  and `FrameViewer.tsx` each gained a "Split source" number input (0 =
+  local, matching the proto default) plumbed into every request, and an
+  always-on notification subscription (previously `FrameViewer`'s
+  subscription was tied to the streaming start/stop lifecycle -- now
+  permanent, since a non-streaming relayed `CaptureFrame`/`GetFrameChunk`
+  call also needs to receive its `PeripheralResponse`) feeding both the
+  correlator and (`FrameViewer` only) the existing `FrameStreamChunk`
+  handling, itself now gated on an `isStreamingRef` so a stray/late chunk
+  after "Stop Streaming" doesn't render. `FrameStreamChunk.source` is
+  displayed as "Stream source" when nonzero.
+  **Not done**: `SettingsPanel.tsx` (the *generic* `cormoran_custom_settings`
+  subsystem provided by zmk-feature-custom-settings, not this module's own
+  proto) still hardcodes `source: SOURCE_LOCAL` everywhere -- adding a
+  source selector there is a separate, smaller chunk of remaining work
+  against a different RPC subsystem's request/response shapes, left for
+  later. No device/peripheral auto-discovery UI either (F.2's inventory
+  caching was intentionally not implemented -- see F.7); the source input
+  is a plain number the user sets manually.
+  Verified: `web/test/relay.spec.ts` (new) covers
+  resolve-on-matching-notification, ignore-unmatched-id,
+  ignore-non-PeripheralResponse (e.g. a `FrameStreamChunk`),
+  ignore-garbage-payload, timeout-rejects (fake timers), `clear()`-rejects,
+  a resolved id not double-resolving, and `callPmw3610Request()`'s
+  immediate-vs-deferred paths including an empty-response error; all prior
+  `SensorInfo`/`FrameViewer` component tests, `npm run lint`, and
+  `npm run build` (including `tsc` typecheck) still pass.
 
 ### Hardware validation status (2026-07)
 
 No PMW3610 sensor or split-capable board pair was attached in this
-environment. F-a through F-d were validated at the build/native_sim/
+environment. F-a through F-e were validated at the build/native_sim/
 web-test level only (see above) — not against a real sensor's persisted
 `cpi@<id>` value across reboot, nor a real two-half split link exercising
 the actual BLE relay transport (only the peripheral-side executor logic was
 exercised, via a local self-test bypassing the transport — this covers
 correctness of "given this decoded request, is the local execution/response
 right", not the wire relay itself, BLE MTU chunking of a >MTU relay event,
-or real-world timing/loss behavior). Re-run the "Validation plan (hardware)"
-steps below (extended with a second device / settings-id / a real second
-half / a real SetFrameStream from a peripheral) once hardware is available.
+or real-world timing/loss behavior), nor the web UI's relay correlation
+against a real firmware round-trip (only unit-tested against synthetic
+notification payloads). Re-run the "Validation plan (hardware)" steps below
+(extended with a second device / settings-id / a real second half / a real
+SetFrameStream from a peripheral, driven from the web UI's new "Split
+source" input) once hardware is available.
 
 Facts about the dependencies below were verified against the checked-out
 sources (paths cited).
