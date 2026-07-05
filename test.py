@@ -188,10 +188,15 @@ class WestCommandsTests(unittest.TestCase):
                         "CONFIG_ZMK_SPLIT_ROLE_CENTRAL=y",
                         "CONFIG_ZMK_SPLIT_RELAY_EVENT=y",
                         "CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY=y",
+                        "CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST=y",
                         "CONFIG_ZMK_STUDIO=y",
                         "CONFIG_ZMK_PMW3610_STUDIO_RPC=y",
                     ],
                     device=[],
+                    elf_symbols=[
+                        "pmw3610_split_relay_central_test_init",
+                        "pmw3610_relay_broadcast_request",
+                    ],
                 ),
             }
         )

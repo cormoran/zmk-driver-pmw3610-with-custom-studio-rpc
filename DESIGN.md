@@ -674,9 +674,10 @@ Everything below was design; implementation status per stage (F.6):
   proto) still hardcodes `source: SOURCE_LOCAL` everywhere -- adding a
   source selector there is a separate, smaller chunk of remaining work
   against a different RPC subsystem's request/response shapes, left for
-  later. No device/peripheral auto-discovery UI either (F.2's inventory
-  caching was intentionally not implemented -- see F.7); the source input
-  is a plain number the user sets manually.
+  later. At the time this was written there was also no device/peripheral
+  auto-discovery UI (see F-f below, added afterwards) -- the source input
+  was a plain number the user had to set manually with no way to know
+  which sources existed.
   Verified: `web/test/relay.spec.ts` (new) covers
   resolve-on-matching-notification, ignore-unmatched-id,
   ignore-non-PeripheralResponse (e.g. a `FrameStreamChunk`),
@@ -685,11 +686,77 @@ Everything below was design; implementation status per stage (F.6):
   immediate-vs-deferred paths including an empty-response error; all prior
   `SensorInfo`/`FrameViewer` component tests, `npm run lint`, and
   `npm run build` (including `tsc` typecheck) still pass.
+- **F-f (list every PMW3610 across the whole keyboard) — implemented.**
+  F.2's original plan was a cached device inventory kept up to date by a
+  peripheral "announce on connect" + a `DeviceInventoryChanged`
+  notification; that was never built. Once F-a through F-e were done, a
+  gap became concrete: there was still no way to discover *which* `source`
+  values (peripherals) exist at all -- the user had to already know. Rather
+  than build the F.2 caching design (adds boot-time announce plumbing +
+  cache-invalidation state), this reuses the relay mechanism directly:
+  `GetInfoRequest.source` gained a sentinel, `PMW3610_SOURCE_ALL =
+  0xFFFFFFFF` (`#define` in `pmw3610_request_exec.h`) -- `source: 0`
+  local devices are returned synchronously as usual, and (if
+  `CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY`) the *same* request is additionally
+  broadcast to every connected peripheral via a new fire-and-forget
+  `pmw3610_relay_broadcast_request()` (factored out of
+  `pmw3610_relay_dispatch_request()`'s existing encode/raise step into a
+  shared `send_relay_request()` helper); each peripheral answers
+  independently as its own `PeripheralResponse`, all sharing one new
+  `GetInfoResponse.relay_request_id` field the caller correlates by.
+  `pmw3610_handler.c`'s dispatch special-cases this exactly once (GetInfo +
+  source == ALL: execute locally *and* broadcast, instead of the normal
+  "local xor relay" branch) -- no other request kind supports the
+  sentinel. web/src/relay.ts's `PeripheralResponseCorrelator` gained
+  `collectBroadcast(requestId, windowMs)`, collecting every
+  `PeripheralResponse` for a request_id over a window (as opposed to
+  `waitFor()`'s single-match-then-done) instead of timing out on the
+  (correct, expected) case of zero-or-more answers; `SensorInfo.tsx` got a
+  "Scan All Sources" button/card listing one row per discovered source.
+  **Deliberately not implemented**: a synchronous "list connected
+  peripherals" query (which would be simpler and not need the async
+  collect-over-a-window dance) -- ZMK's split transport tracks connection
+  state in `active_transport` (`app/src/split/central.c`), but does not
+  expose it via any public header (only a peripheral-battery-level getter
+  exists for a *known* source, not enumeration), so reaching into it would
+  mean depending on a ZMK-internal symbol not meant for module use. The
+  relay broadcast achieves the same practical result (discover which
+  peripherals exist, by asking them) without that.
+  Verified: firmware -- all 8 `west zmk-build` artifacts still succeed,
+  including `pmw3610_split_central` with a **new** central-role self-test
+  (`pmw3610_split_relay_central_test_init`, asserts
+  `pmw3610_relay_broadcast_request()` assigns distinct nonzero
+  `request_id`s) enabled via `CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST=y`
+  and checked by `test.py`'s ELF-symbol assertions; `tests/split_peripheral`
+  and `tests/studio` still pass unchanged (the peripheral executor ignores
+  `source` regardless of its value, so ALL needed no peripheral-side
+  changes to test). **A dedicated native_sim `tests/split_central` test
+  was attempted and abandoned**: `pmw3610_relay_broadcast_request()`
+  synchronously raises the same `ZMK_RELAY_EVENT_CENTRAL_TO_PERIPHERAL`
+  path as the already-central-only-testable
+  `pmw3610_relay_dispatch_request()`, which calls
+  `zmk_split_central_send_relay_event()` -- implemented only by ZMK's BLE
+  split transport (`app/src/split/bluetooth/central.c`), which needs
+  `CONFIG_ZMK_BLE=y` (a working Bluetooth stack) to link; getting that
+  running under native_sim was judged out of scope for this check, so
+  `pmw3610_split_central`'s central self-test is compile/link-verified
+  only, the same limitation the (pre-existing, never native_sim-tested)
+  single-target relay dispatch already had. Also fixed in passing: added a
+  missing `#include <zmk/split/central.h>` in `pmw3610_relay.c` (needed for
+  `zmk_split_central_send_relay_event`'s declaration -- `event_manager.h`'s
+  `ZMK_RELAY_EVENT_CENTRAL_TO_PERIPHERAL()` doesn't include it for you, unlike
+  the peripheral-side macro) -- harmless on a real board build (something
+  else was pulling it in transitively there) but a hard compile error
+  without it once a config without that transitive include was tried.
+  web: `web/test/relay.spec.ts` gained `collectBroadcast()` coverage
+  (collects multiple responses within the window, resolves empty when
+  nobody answers, doesn't double-consume with a concurrent `waitFor()`);
+  `npm test`/`lint`/`build` all still pass.
 
 ### Hardware validation status (2026-07)
 
 No PMW3610 sensor or split-capable board pair was attached in this
-environment. F-a through F-e were validated at the build/native_sim/
+environment. F-a through F-f were validated at the build/native_sim/
 web-test level only (see above) — not against a real sensor's persisted
 `cpi@<id>` value across reboot, nor a real two-half split link exercising
 the actual BLE relay transport (only the peripheral-side executor logic was

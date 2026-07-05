@@ -21,7 +21,10 @@
  *    DeferredResponse; when the matching `RelayResponse` relays back in, it
  *    is re-raised as a `PeripheralResponse` Studio notification (the same
  *    "custom notification" mechanism used by SetFrameStream's
- *    FrameStreamChunk).
+ *    FrameStreamChunk). pmw3610_relay_broadcast_request() is the
+ *    fire-and-forget sibling used for GetInfo's `source = PMW3610_SOURCE_ALL`
+ *    ("list every PMW3610 across the whole keyboard") -- every connected
+ *    peripheral answers independently, sharing one request_id.
  *
  * Pattern (event struct shape, relay macros, subsystem-index lookup,
  * static-buffer notification encoding) copied from
@@ -48,6 +51,15 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 #include <zmk/event_manager.h>
+
+/* ZMK_RELAY_EVENT_CENTRAL_TO_PERIPHERAL() (invoked below) expands to a call
+ * to zmk_split_central_send_relay_event() but -- unlike the peripheral
+ * side's ZMK_RELAY_EVENT_PERIPHERAL_TO_CENTRAL(), which pulls in
+ * <zmk/split/peripheral.h> itself -- event_manager.h does not include
+ * <zmk/split/central.h> for its declaration, so callers must. */
+#if IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+#include <zmk/split/central.h>
+#endif
 
 #include <cormoran/pmw3610/pmw3610.pb.h>
 #include <cormoran/pmw3610/pmw3610_relay.h>
@@ -264,10 +276,13 @@ static int custom_subsystem_index(void) {
 
 static uint32_t next_relay_request_id = 1;
 
-void pmw3610_relay_dispatch_request(uint32_t source, const cormoran_pmw3610_Request *req,
-                                    cormoran_pmw3610_Response *resp) {
-    ARG_UNUSED(source); /* Transport broadcasts to every peripheral -- see file doc comment. */
-
+/* Encodes `req` into a RelayRequest and raises it for CENTRAL_TO_PERIPHERAL
+ * relay (see the macro invocations above) -- shared by
+ * pmw3610_relay_dispatch_request() (single-target, produces a
+ * DeferredResponse) and pmw3610_relay_broadcast_request() (fire-and-forget,
+ * every connected peripheral answers independently). Returns the assigned
+ * request_id (nonzero) on success, or 0 on encode failure (logged). */
+static uint32_t send_relay_request(const cormoran_pmw3610_Request *req) {
     uint32_t request_id = next_relay_request_id++;
 
     cormoran_pmw3610_RelayRequest relay_req = cormoran_pmw3610_RelayRequest_init_zero;
@@ -279,20 +294,35 @@ void pmw3610_relay_dispatch_request(uint32_t source, const cormoran_pmw3610_Requ
     pb_ostream_t ostream = pb_ostream_from_buffer(event.payload, sizeof(event.payload));
     if (!pb_encode(&ostream, cormoran_pmw3610_RelayRequest_fields, &relay_req)) {
         LOG_WRN("Failed to encode pmw3610 relay request: %s", PB_GET_ERROR(&ostream));
+        return 0;
+    }
+    event.size = (uint16_t)ostream.bytes_written;
+
+    raise_zmk_pmw3610_relay_request(event);
+    return request_id;
+}
+
+void pmw3610_relay_dispatch_request(uint32_t source, const cormoran_pmw3610_Request *req,
+                                    cormoran_pmw3610_Response *resp) {
+    ARG_UNUSED(source); /* Transport broadcasts to every peripheral -- see file doc comment. */
+
+    uint32_t request_id = send_relay_request(req);
+    if (request_id == 0) {
         cormoran_pmw3610_ErrorResponse err = cormoran_pmw3610_ErrorResponse_init_zero;
         snprintf(err.message, sizeof(err.message), "failed to encode relay request");
         resp->which_response_type = cormoran_pmw3610_Response_error_tag;
         resp->response_type.error = err;
         return;
     }
-    event.size = (uint16_t)ostream.bytes_written;
-
-    raise_zmk_pmw3610_relay_request(event);
 
     cormoran_pmw3610_DeferredResponse deferred = cormoran_pmw3610_DeferredResponse_init_zero;
     deferred.request_id = request_id;
     resp->which_response_type = cormoran_pmw3610_Response_deferred_tag;
     resp->response_type.deferred = deferred;
+}
+
+uint32_t pmw3610_relay_broadcast_request(const cormoran_pmw3610_Request *req) {
+    return send_relay_request(req);
 }
 
 static K_MUTEX_DEFINE(peripheral_response_notification_lock);
@@ -409,10 +439,11 @@ ZMK_SUBSCRIPTION(pmw3610_relay_notification_notify, zmk_pmw3610_relay_notificati
 
 #endif // CONFIG_ZMK_SPLIT_ROLE_CENTRAL
 
-/* --- native_sim-only self-test (peripheral role): exercise the relay --- */
-/* --- executor without a real transport (native_sim cannot simulate one) --- */
+/* --- native_sim-only self-tests: exercise the relay logic without a --- */
+/* --- real transport (native_sim cannot simulate one) --- */
 
-#if IS_ENABLED(CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST)
+#if IS_ENABLED(CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST) &&                                         \
+    !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 
 static int pmw3610_split_relay_test_init(void) {
     cormoran_pmw3610_RelayRequest relay_req = cormoran_pmw3610_RelayRequest_init_zero;
@@ -503,4 +534,37 @@ static int pmw3610_split_relay_test_init(void) {
 
 SYS_INIT(pmw3610_split_relay_test_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
 
-#endif // CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST
+#endif // CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST && !CONFIG_ZMK_SPLIT_ROLE_CENTRAL
+
+#if IS_ENABLED(CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
+
+/* Central-side counterpart: asserts pmw3610_relay_broadcast_request()
+ * (the GetInfo{source: PMW3610_SOURCE_ALL} broadcast path) assigns
+ * distinct, nonzero request_ids -- see tests/split_central. Does not (and
+ * cannot, without a real peripheral) assert that a broadcast actually
+ * reaches anyone; that is exactly what native_sim cannot simulate. */
+static int pmw3610_split_relay_central_test_init(void) {
+    cormoran_pmw3610_Request req = cormoran_pmw3610_Request_init_zero;
+    req.which_request_type = cormoran_pmw3610_Request_get_info_tag;
+    req.request_type.get_info.source = PMW3610_SOURCE_ALL;
+
+    uint32_t id1 = pmw3610_relay_broadcast_request(&req);
+    if (id1 == 0) {
+        LOG_ERR("Split relay central test: broadcast returned request_id 0");
+        return -EINVAL;
+    }
+
+    uint32_t id2 = pmw3610_relay_broadcast_request(&req);
+    if (id2 == 0 || id2 == id1) {
+        LOG_ERR("Split relay central test: broadcast request_ids did not increment (%u, %u)", id1,
+                id2);
+        return -EINVAL;
+    }
+
+    printk("PASS: pmw3610_split_relay_central_broadcast\n");
+    return 0;
+}
+
+SYS_INIT(pmw3610_split_relay_central_test_init, APPLICATION, CONFIG_APPLICATION_INIT_PRIORITY);
+
+#endif // CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST && CONFIG_ZMK_SPLIT_ROLE_CENTRAL

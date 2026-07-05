@@ -8,11 +8,26 @@
 import { Notification, Response } from "./proto/cormoran/pmw3610/pmw3610";
 
 const DEFAULT_TIMEOUT_MS = 6000; // > firmware's ~5s frame-capture deadline
+const DEFAULT_BROADCAST_WINDOW_MS = 2000;
+
+/**
+ * GetInfoRequest.source sentinel ("list every PMW3610 across the whole
+ * keyboard" -- see pmw3610.proto's doc comment on GetInfoRequest). Local
+ * devices are returned synchronously (same call, same as source: 0); any
+ * connected peripheral's devices arrive afterwards as separate
+ * PeripheralResponse notifications sharing GetInfoResponse.relayRequestId,
+ * collected via PeripheralResponseCorrelator.collectBroadcast().
+ */
+export const PMW3610_SOURCE_ALL = 0xffffffff;
 
 interface PendingRequest {
   resolve: (response: Response) => void;
   reject: (error: Error) => void;
   timeoutId: ReturnType<typeof setTimeout>;
+}
+
+interface BroadcastListener {
+  onResponse: (source: number, response: Response) => void;
 }
 
 /**
@@ -23,6 +38,7 @@ interface PendingRequest {
  */
 export class PeripheralResponseCorrelator {
   private pending = new Map<number, PendingRequest>();
+  private broadcastListeners = new Map<number, BroadcastListener>();
 
   constructor(private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS) {}
 
@@ -42,9 +58,34 @@ export class PeripheralResponseCorrelator {
   }
 
   /**
-   * Feed a raw Studio custom-notification payload. Resolves the matching
-   * pending request (if any) when it decodes to a PeripheralResponse with a
-   * response payload. Returns true if a pending request was resolved.
+   * Collect every PeripheralResponse for `requestId` (a
+   * GetInfoResponse.relayRequestId from a `source: PMW3610_SOURCE_ALL` call)
+   * that arrives within `windowMs`, then resolve with all of them. Unlike
+   * waitFor(), this expects zero or more responses (one per connected
+   * peripheral) rather than exactly one, so it always resolves once the
+   * window elapses instead of timing out.
+   */
+  collectBroadcast(
+    requestId: number,
+    windowMs: number = DEFAULT_BROADCAST_WINDOW_MS
+  ): Promise<Array<{ source: number; response: Response }>> {
+    return new Promise((resolve) => {
+      const results: Array<{ source: number; response: Response }> = [];
+      this.broadcastListeners.set(requestId, {
+        onResponse: (source, response) => results.push({ source, response }),
+      });
+      setTimeout(() => {
+        this.broadcastListeners.delete(requestId);
+        resolve(results);
+      }, windowMs);
+    });
+  }
+
+  /**
+   * Feed a raw Studio custom-notification payload. Resolves a matching
+   * pending waitFor()/collectBroadcast() registration (if any) when it
+   * decodes to a PeripheralResponse with a response payload. Returns true if
+   * it was consumed by one of them.
    */
   handleNotificationPayload(payload: Uint8Array): boolean {
     let notification: Notification;
@@ -57,10 +98,16 @@ export class PeripheralResponseCorrelator {
     if (!peripheralResponse || !peripheralResponse.response) {
       return false;
     }
-    return this.resolve(
-      peripheralResponse.requestId,
-      peripheralResponse.response
-    );
+    const { source, requestId, response } = peripheralResponse;
+    if (this.resolve(requestId, response)) {
+      return true;
+    }
+    const broadcastListener = this.broadcastListeners.get(requestId);
+    if (broadcastListener) {
+      broadcastListener.onResponse(source, response);
+      return true;
+    }
+    return false;
   }
 
   private resolve(requestId: number, response: Response): boolean {
@@ -74,7 +121,10 @@ export class PeripheralResponseCorrelator {
     return true;
   }
 
-  /** Reject every still-pending request (e.g. on disconnect/unmount). */
+  /** Reject every still-pending waitFor() request (e.g. on disconnect/
+   * unmount). Pending collectBroadcast() windows are left to resolve with
+   * whatever they already collected -- there's nothing to "reject" about
+   * partial inventory data. */
   clear(reason: string): void {
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timeoutId);

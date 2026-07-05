@@ -95,6 +95,75 @@ describe("PeripheralResponseCorrelator", () => {
       )
     ).toBe(false);
   });
+
+  describe("collectBroadcast", () => {
+    it("collects every PeripheralResponse for a request id within the window", async () => {
+      jest.useFakeTimers();
+      try {
+        const correlator = new PeripheralResponseCorrelator();
+        const resultsPromise = correlator.collectBroadcast(20, 1000);
+
+        correlator.handleNotificationPayload(
+          Notification.encode(
+            Notification.create({
+              peripheralResponse: {
+                source: 1,
+                requestId: 20,
+                response: { getInfo: { devices: [{ deviceIndex: 0 }] } },
+              },
+            })
+          ).finish()
+        );
+        correlator.handleNotificationPayload(
+          Notification.encode(
+            Notification.create({
+              peripheralResponse: {
+                source: 2,
+                requestId: 20,
+                response: { getInfo: { devices: [] } },
+              },
+            })
+          ).finish()
+        );
+
+        jest.advanceTimersByTime(1000);
+        const results = await resultsPromise;
+
+        expect(results).toHaveLength(2);
+        expect(results.map((r) => r.source).sort()).toEqual([1, 2]);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it("resolves with an empty array when nobody answers", async () => {
+      jest.useFakeTimers();
+      try {
+        const correlator = new PeripheralResponseCorrelator();
+        const resultsPromise = correlator.collectBroadcast(21, 500);
+        jest.advanceTimersByTime(500);
+        await expect(resultsPromise).resolves.toEqual([]);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it("does not let a waitFor() and a collectBroadcast() on the same id double-consume", async () => {
+      const correlator = new PeripheralResponseCorrelator();
+      // waitFor() takes priority (checked first in handleNotificationPayload);
+      // once it resolves the entry is gone, so a second identical
+      // notification would fall through to any broadcast listener instead.
+      const pending = correlator.waitFor(30);
+      const payload = Notification.encode(
+        Notification.create({
+          peripheralResponse: { source: 1, requestId: 30, response: {} },
+        })
+      ).finish();
+
+      expect(correlator.handleNotificationPayload(payload)).toBe(true);
+      await pending;
+    });
+  });
 });
 
 describe("callPmw3610Request", () => {

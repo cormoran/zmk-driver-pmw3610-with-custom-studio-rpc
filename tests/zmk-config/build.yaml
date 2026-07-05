@@ -69,9 +69,18 @@ include:
       - pmw3610-trackball
       - pmw3610-split-rpc-relay
 
+  # CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST=y is added here (rather than a
+  # dedicated native_sim test) because the central-role self-test needs
+  # zmk_split_central_send_relay_event(), only implemented by the real BLE
+  # split transport (CONFIG_ZMK_SPLIT_BLE) -- native_sim would need a
+  # working BT stack to link it, which is out of scope for this check. This
+  # build only proves the central broadcast test code compiles/links; its
+  # PASS/FAIL boot-log output is not observable without real hardware (see
+  # DESIGN.md "Hardware validation status").
   - artifact: pmw3610_split_central
     board: xiao_ble//zmk
     shield: tester_xiao
+    cmake-args: -DCONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST=y
     snippets:
       - studio-rpc-usb-uart
       - pmw3610-split-rpc-relay

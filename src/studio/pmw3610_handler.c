@@ -73,11 +73,26 @@ static bool pmw3610_rpc_handle_request(const zmk_custom_CallRequest *raw_request
     }
 
     uint32_t source = pmw3610_request_get_source(&req);
-    if (source == 0) {
+    /* GetInfo{source: PMW3610_SOURCE_ALL} ("list every PMW3610 across the
+     * whole keyboard") answers with local devices synchronously -- same as
+     * source 0, since there is no way to enumerate connected peripherals
+     * without asking them -- and additionally broadcasts to every
+     * connected peripheral, each answering later as its own
+     * PeripheralResponse notification (see pmw3610.proto). */
+    bool is_broadcast_get_info = req.which_request_type == cormoran_pmw3610_Request_get_info_tag &&
+                                 source == PMW3610_SOURCE_ALL;
+
+    if (source == 0 || is_broadcast_get_info) {
         if (!pmw3610_request_exec_handle(&req, resp)) {
             LOG_WRN("Unsupported pmw3610 request type: %d", req.which_request_type);
             set_error(resp, "Unsupported request type");
         }
+#if IS_ENABLED(CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY)
+        if (is_broadcast_get_info &&
+            resp->which_response_type == cormoran_pmw3610_Response_get_info_tag) {
+            resp->response_type.get_info.relay_request_id = pmw3610_relay_broadcast_request(&req);
+        }
+#endif
     } else {
 #if IS_ENABLED(CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY)
         pmw3610_relay_dispatch_request(source, &req, resp);

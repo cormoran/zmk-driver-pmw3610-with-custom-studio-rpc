@@ -9,11 +9,20 @@ import {
   Request,
   Response,
 } from "./proto/cormoran/pmw3610/pmw3610";
-import { callPmw3610Request, PeripheralResponseCorrelator } from "./relay";
+import {
+  callPmw3610Request,
+  PeripheralResponseCorrelator,
+  PMW3610_SOURCE_ALL,
+} from "./relay";
 
 export const PMW3610_SUBSYSTEM_IDENTIFIER = "cormoran__pmw3610";
 export const PMW3610_PRODUCT_ID = 0x3e;
 const DIAGNOSTICS_POLL_INTERVAL_MS = 1000;
+
+export interface SourceInventory {
+  source: number;
+  devices: DeviceInfo[];
+}
 
 export function SensorInfo() {
   const zmkApp = useContext(ZMKAppContext);
@@ -29,6 +38,12 @@ export function SensorInfo() {
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  // "List all sources" (PMW3610_SOURCE_ALL) inventory scan -- separate from
+  // the single-source `devices`/`source` state above, since there's no
+  // built-in way to discover which peripheral sources exist otherwise (see
+  // pmw3610.proto's GetInfoRequest doc comment).
+  const [inventory, setInventory] = useState<SourceInventory[] | null>(null);
+  const [isScanning, setIsScanning] = useState(false);
 
   const correlatorRef = useRef(new PeripheralResponseCorrelator());
 
@@ -55,6 +70,49 @@ export function SensorInfo() {
       setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  // "List all sources": local devices come back synchronously (same call,
+  // like source: 0); if relaying is enabled, any connected peripheral's
+  // devices arrive afterwards as separate PeripheralResponse notifications
+  // sharing relayRequestId, collected over a short window.
+  const scanAllSources = async () => {
+    setIsScanning(true);
+    setError(null);
+    try {
+      const resp = await callRequest(
+        Request.create({ getInfo: { source: PMW3610_SOURCE_ALL } })
+      );
+      if (resp.error) {
+        throw new Error(resp.error.message);
+      }
+      const groups: SourceInventory[] = [
+        { source: 0, devices: resp.getInfo?.devices ?? [] },
+      ];
+
+      const relayRequestId = resp.getInfo?.relayRequestId ?? 0;
+      if (relayRequestId) {
+        const peripheralResults =
+          await correlatorRef.current.collectBroadcast(relayRequestId);
+        for (const {
+          source: peripheralSource,
+          response,
+        } of peripheralResults) {
+          if (response.getInfo) {
+            groups.push({
+              source: peripheralSource,
+              devices: response.getInfo.devices,
+            });
+          }
+        }
+      }
+
+      setInventory(groups);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally {
+      setIsScanning(false);
     }
   };
 
@@ -230,6 +288,47 @@ export function SensorInfo() {
           </dl>
         ) : (
           <p className="empty-message">No devices reported.</p>
+        )}
+      </section>
+
+      <section className="card">
+        <h2>Split Inventory</h2>
+        <p>
+          Lists every PMW3610 across the whole keyboard: this device&apos;s own
+          sensors, plus (if a split peripheral is relaying) each
+          peripheral&apos;s. Use a row&apos;s source number in the "Split
+          source" field above to inspect it.
+        </p>
+        <div className="toolbar">
+          <button
+            className="btn"
+            disabled={isScanning}
+            onClick={() => void scanAllSources()}
+          >
+            {isScanning ? "Scanning..." : "Scan All Sources"}
+          </button>
+        </div>
+        {inventory ? (
+          <dl className="setting-summary">
+            {inventory.map((group) => (
+              <div key={group.source}>
+                <dt>
+                  {group.source === 0 ? "Local" : `Peripheral ${group.source}`}
+                </dt>
+                <dd>
+                  {group.devices.length === 0
+                    ? "no devices"
+                    : group.devices
+                        .map((d, i) =>
+                          d.settingsId ? `${i} (${d.settingsId})` : `${i}`
+                        )
+                        .join(", ")}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        ) : (
+          <p className="empty-message">Not scanned yet.</p>
         )}
       </section>
 

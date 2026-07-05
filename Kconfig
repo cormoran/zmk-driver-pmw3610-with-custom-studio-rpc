@@ -151,13 +151,16 @@ config ZMK_PMW3610_SPLIT_RPC_RELAY
 config ZMK_PMW3610_SPLIT_RPC_RELAY_TEST
     bool "Enable native_sim-only PMW3610 split relay test hooks"
     depends on ZMK_PMW3610_SPLIT_RPC_RELAY
-    depends on !ZMK_SPLIT_ROLE_CENTRAL
     help
-      Adds a boot-time self-test (peripheral role only) that synthesizes a
-      relayed request locally (bypassing the real transport, which
-      native_sim cannot exercise end-to-end) and asserts the resulting
-      relay response, printing PASS/FAIL to the log -- see
-      tests/split_peripheral. Not for production builds.
+      Adds a boot-time self-test that bypasses the real split transport
+      (which native_sim cannot exercise end-to-end) and asserts firmware
+      behavior directly, printing PASS/FAIL to the log:
+        - Peripheral role: synthesizes a relayed request locally and
+          asserts the resulting relay response -- see
+          tests/split_peripheral.
+        - Central role: asserts pmw3610_relay_broadcast_request() assigns
+          distinct nonzero request_ids -- see tests/split_central.
+      Not for production builds.
 
 # Internal: whether nanopb should generate code for pmw3610*.proto. Split out
 # from ZMK_PMW3610_STUDIO_RPC (which additionally implies CONFIG_ZMK_STUDIO,

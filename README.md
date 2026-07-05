@@ -378,13 +378,37 @@ single-peripheral split, but means a multi-peripheral build gets one
 `PeripheralResponse`/`FrameStreamChunk` per peripheral for the same
 `request_id`/stream.
 
+**Listing every PMW3610 across the whole keyboard**: there is no API to ask
+ZMK's split transport "which peripherals are currently connected" (nothing
+this module could hook into anyway), so `GetInfo` instead accepts the
+sentinel `source = 0xFFFFFFFF`: it answers with this device's own local
+devices synchronously (exactly like `source: 0`), and — if relaying is
+enabled — the *same* request is broadcast to every connected peripheral,
+each answering independently as its own `PeripheralResponse` (carrying
+`GetInfoResponse.relay_request_id` so the caller can correlate them). The
+web UI's Sensor card has a "Scan All Sources" button that does exactly
+this, collecting peripheral answers for ~2s and listing a row per source.
+
+```jsonc
+// List every PMW3610 across the whole keyboard
+{ "getInfo": { "source": 4294967295 } }
+// -> { "getInfo": { "devices": [ ... local ... ], "relayRequestId": 3 } }  // immediate
+// ... then zero or more notifications, one per connected peripheral:
+// { "peripheralResponse": { "source": 1, "requestId": 3,
+//     "response": { "getInfo": { "devices": [ ... ] } } } }
+```
+
 This has been build-tested (both roles compile, see
 `tests/zmk-config/build.yaml`'s `pmw3610_split_*` artifacts) and the
 peripheral-side request execution (including a CaptureFrame call and the
 genuinely-unsupported-request-kind fallback) has a native_sim self-test
 (`tests/split_peripheral`), but **not yet validated against real split
 hardware** — no split-capable board pair was available while developing
-this feature.
+this feature. The central-side broadcast dispatch additionally has a
+self-test (`CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST` on the
+`pmw3610_split_central` build), but only compile/link-verified: it needs
+ZMK's real BLE split transport, which native_sim cannot provide without a
+working Bluetooth stack.
 
 ### Web UI
 
