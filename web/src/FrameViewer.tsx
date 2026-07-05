@@ -4,6 +4,7 @@ import {
   ZMKAppContext,
 } from "@cormoran/zmk-studio-react-hook";
 import {
+  FrameStreamChunk,
   Notification as PMW3610Notification,
   Request,
   Response,
@@ -16,6 +17,7 @@ import {
   type FrameChunk,
 } from "./frame";
 import { isUnlockRequiredError } from "./useStudioLockState";
+import { callPmw3610Request, PeripheralResponseCorrelator } from "./relay";
 
 export const PMW3610_SUBSYSTEM_IDENTIFIER = "cormoran__pmw3610";
 
@@ -46,6 +48,9 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
 
   const [side, setSide] = useState(DEFAULT_SIDE);
   const [deviceIndex, setDeviceIndex] = useState(0);
+  // 0 = this device's own local PMW3610s; 1+ = a split peripheral's, relayed
+  // asynchronously (see DESIGN.md Phase F / web/src/relay.ts).
+  const [source, setSource] = useState(0);
   const [advanced, setAdvanced] = useState<AdvancedOptions>(DEFAULT_ADVANCED);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
@@ -55,18 +60,24 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   const [complete, setComplete] = useState<boolean | null>(null);
   const [durationMs, setDurationMs] = useState<number | null>(null);
   const [fps, setFps] = useState<number | null>(null);
+  const [streamSource, setStreamSource] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const frameCountRef = useRef(0);
   const fpsWindowStartRef = useRef(0);
-  const unsubscribeNotificationsRef = useRef<(() => void) | null>(null);
+  const isStreamingRef = useRef(false);
+  const correlatorRef = useRef(new PeripheralResponseCorrelator());
   // Per-frame_id incremental assembler, keyed so a late chunk from a
   // previous frame_id (should not happen, but notifications are
   // best-effort/unordered in principle) cannot corrupt the current frame.
   const assemblersRef = useRef(
     new Map<number, ReturnType<typeof createFrameAssembler>>()
   );
+
+  useEffect(() => {
+    isStreamingRef.current = isStreaming;
+  }, [isStreaming]);
 
   const callRequest = async (request: Request): Promise<Response> => {
     const connection = zmkApp?.state.connection;
@@ -75,11 +86,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     }
     const service = new ZMKCustomSubsystem(connection, subsystem.index);
     const payload = Request.encode(request).finish();
-    const responsePayload = await service.callRPC(payload);
-    if (!responsePayload) {
-      throw new Error("Empty response");
-    }
-    return Response.decode(responsePayload);
+    return callPmw3610Request(service, payload, correlatorRef.current);
   };
 
   const captureOnce = async (): Promise<void> => {
@@ -88,6 +95,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
       Request.create({
         captureFrame: {
           deviceIndex,
+          source,
           pixelCount: pixelCountRequested,
           maxInvalidRetries: advanced.maxInvalidRetries
             ? Number.parseInt(advanced.maxInvalidRetries, 10)
@@ -110,7 +118,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     for (const offset of offsets) {
       const chunkResp = await callRequest(
         Request.create({
-          getFrameChunk: { frameId: captureFrame.frameId, offset },
+          getFrameChunk: { frameId: captureFrame.frameId, offset, source },
         })
       );
       if (chunkResp.error) {
@@ -196,16 +204,11 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   // Notification-based streaming (Phase E): SetFrameStream{enable: true}
   // starts a firmware-side capture loop that raises one FrameStreamChunk
   // notification per 128-byte chunk of every captured frame, instead of
-  // this component polling CaptureFrame+GetFrameChunk in a loop.
-  const handleFrameStreamNotification = (payload: Uint8Array) => {
-    let notification: PMW3610Notification;
-    try {
-      notification = PMW3610Notification.decode(payload);
-    } catch {
-      return;
-    }
-    const chunk = notification.frameStreamChunk;
-    if (!chunk) return;
+  // this component polling CaptureFrame+GetFrameChunk in a loop. Ignored
+  // unless this component is actually streaming (isStreamingRef), so a
+  // stray/late chunk after Stop Streaming doesn't render.
+  const handleFrameStreamNotification = (chunk: FrameStreamChunk) => {
+    if (!isStreamingRef.current) return;
 
     const assemblers = assemblersRef.current;
     // A new frame_id means any previous (necessarily incomplete, or it
@@ -241,6 +244,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     setPixelCount(chunk.totalSize);
     setComplete(chunk.complete);
     setDurationMs(null); // not reported per-frame while streaming
+    setStreamSource(chunk.source);
 
     frameCountRef.current++;
     const now = performance.now();
@@ -257,6 +261,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
       Request.create({
         setFrameStream: {
           deviceIndex,
+          source,
           enable,
           pixelCount: enable ? side * side : 0,
           maxInvalidRetries: advanced.maxInvalidRetries
@@ -273,8 +278,6 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
 
   const stopStreaming = async () => {
     setIsStreaming(false);
-    unsubscribeNotificationsRef.current?.();
-    unsubscribeNotificationsRef.current = null;
     try {
       await setFrameStream(false);
     } catch (e) {
@@ -289,23 +292,12 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     frameCountRef.current = 0;
     fpsWindowStartRef.current = performance.now();
     setFps(null);
+    setStreamSource(null);
 
     try {
-      unsubscribeNotificationsRef.current = zmkApp.onNotification({
-        type: "custom",
-        subsystemIndex: subsystem.index,
-        callback: (notification) =>
-          handleFrameStreamNotification(notification.payload),
-      });
       const streaming = await setFrameStream(true);
       setIsStreaming(streaming);
-      if (!streaming) {
-        unsubscribeNotificationsRef.current?.();
-        unsubscribeNotificationsRef.current = null;
-      }
     } catch (e) {
-      unsubscribeNotificationsRef.current?.();
-      unsubscribeNotificationsRef.current = null;
       if (isUnlockRequiredError(e)) {
         setError(
           "ZMK Studio is locked -- press the Studio unlock key on your keyboard."
@@ -316,11 +308,39 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     }
   };
 
+  // A single always-on subscription (not tied to the streaming lifecycle)
+  // handles both this component's own relayed requests (CaptureFrame/
+  // GetFrameChunk/SetFrameStream with source != 0 answer asynchronously via
+  // PeripheralResponse -- see web/src/relay.ts) and FrameStreamChunk
+  // notifications, which handleFrameStreamNotification itself gates on
+  // isStreamingRef so a stray chunk after Stop Streaming is dropped.
   useEffect(() => {
+    if (!zmkApp || !subsystem) return;
+    const correlator = correlatorRef.current;
+    const unsubscribe = zmkApp.onNotification({
+      type: "custom",
+      subsystemIndex: subsystem.index,
+      callback: (notification) => {
+        if (correlator.handleNotificationPayload(notification.payload)) {
+          return;
+        }
+        let decoded: PMW3610Notification;
+        try {
+          decoded = PMW3610Notification.decode(notification.payload);
+        } catch {
+          return;
+        }
+        if (decoded.frameStreamChunk) {
+          handleFrameStreamNotification(decoded.frameStreamChunk);
+        }
+      },
+    });
     return () => {
-      unsubscribeNotificationsRef.current?.();
+      unsubscribe();
+      correlator.clear("Subsystem changed or component unmounted");
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zmkApp, subsystem?.index]);
 
   // If Studio locks while streaming, the firmware stops the stream loop on
   // its own (see the lock listener in pmw3610_handler.c) -- but it does not
@@ -331,8 +351,6 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
   // exists.
   useEffect(() => {
     if (locked && isStreaming) {
-      unsubscribeNotificationsRef.current?.();
-      unsubscribeNotificationsRef.current = null;
       // Reacting to an external system (the firmware silently stopping the
       // stream on lock) becoming out of sync with local UI state, not a
       // derived-state anti-pattern -- see the comment above.
@@ -392,6 +410,17 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
           value={deviceIndex}
           onChange={(e) => setDeviceIndex(Number(e.target.value))}
           disabled={isStreaming || locked}
+        />
+
+        <label htmlFor="frame-source">Split source</label>
+        <input
+          id="frame-source"
+          type="number"
+          min={0}
+          value={source}
+          onChange={(e) => setSource(Number(e.target.value))}
+          disabled={isStreaming || locked}
+          title="0 = this device's own sensors; 1+ = a split peripheral's, relayed asynchronously"
         />
       </div>
 
@@ -487,6 +516,14 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
           <dt>FPS (streaming)</dt>
           <dd>{fps !== null ? fps.toFixed(1) : "-"}</dd>
         </div>
+        {streamSource !== null && (
+          <div>
+            <dt>Stream source</dt>
+            <dd>
+              {streamSource === 0 ? "local" : `peripheral ${streamSource}`}
+            </dd>
+          </div>
+        )}
       </dl>
     </section>
   );

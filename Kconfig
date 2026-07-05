@@ -103,23 +103,81 @@ endif #PMW3610
 config ZMK_PMW3610_STUDIO_RPC
     bool "Enable PMW3610 custom Studio RPC"
     depends on ZMK_STUDIO
+    select ZMK_PMW3610_PROTOBUF
     help
       Custom (unofficial) ZMK Studio RPC subsystem exposing PMW3610 sensor
       info and diagnostics. Works with zero PMW3610 devices present (e.g.
       native_sim), so it does not depend on CONFIG_PMW3610 directly.
 
-if ZMK_PMW3610_STUDIO_RPC
-
+# Not scoped `if ZMK_PMW3610_STUDIO_RPC`: the frame capture/streaming
+# handlers that use this buffer (src/studio/pmw3610_request_exec.c) also
+# compile under CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY alone (a split peripheral
+# has no Studio of its own -- see DESIGN.md Phase F).
 config ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE
     int "Static frame capture buffer size (pixels/bytes)"
     default 484
+    depends on ZMK_PMW3610_PROTOBUF
     help
       Size of the static frame buffer used by the CaptureFrame/GetFrameChunk
-      Studio RPC handlers (one byte per pixel). The default (484 = 22x22)
-      matches the driver's default capture pixel count. A CaptureFrame
-      request's pixel_count is clamped to this size.
+      handlers (one byte per pixel). The default (484 = 22x22) matches the
+      driver's default capture pixel count. A CaptureFrame request's
+      pixel_count is clamped to this size.
 
-endif # ZMK_PMW3610_STUDIO_RPC
+config ZMK_PMW3610_SPLIT_RPC_RELAY
+    bool "Relay PMW3610 Studio RPC to split peripherals"
+    depends on ZMK_SPLIT_RELAY_EVENT
+    select ZMK_PMW3610_PROTOBUF
+    help
+      Enable on BOTH halves of a split keyboard to reach PMW3610 devices
+      living on a split peripheral through the central's cormoran__pmw3610
+      Studio RPC subsystem: any request (GetInfo/ReadDiagnostics/
+      ReadRegister/WriteRegister/CaptureFrame/GetFrameChunk/SetFrameStream)
+      with a nonzero `source` is relayed to the matching peripheral over
+      CONFIG_ZMK_SPLIT_RELAY_EVENT, and the response arrives back as a
+      PeripheralResponse Studio notification (relaying is asynchronous,
+      unlike a local request). A peripheral's SetFrameStream chunks relay
+      back the same way, as FrameStreamChunk notifications with `source`
+      filled in. Increase CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN if your
+      build fails a BUILD_ASSERT about the relayed request/response payload
+      size (a GetInfoResponse for multiple peripheral devices needs more
+      room than the framework's default).
+      Note: the underlying split relay event transport broadcasts to every
+      connected peripheral, not to one addressed peripheral -- with more
+      than one peripheral, every peripheral answers every relayed request
+      (each correctly tagged with its own source), which does not compose
+      well with a UI that only expects an answer from a specific one. Safe
+      to enable for a build with a single peripheral.
+
+config ZMK_PMW3610_SPLIT_RPC_RELAY_TEST
+    bool "Enable native_sim-only PMW3610 split relay test hooks"
+    depends on ZMK_PMW3610_SPLIT_RPC_RELAY
+    help
+      Adds a boot-time self-test that bypasses the real split transport
+      (which native_sim cannot exercise end-to-end) and asserts firmware
+      behavior directly, printing PASS/FAIL to the log:
+        - Peripheral role: synthesizes a relayed request locally and
+          asserts the resulting relay response -- see
+          tests/split_peripheral.
+        - Central role: asserts pmw3610_relay_broadcast_request() assigns
+          distinct nonzero request_ids -- see tests/split_central.
+      Not for production builds.
+
+# Internal: whether nanopb should generate code for pmw3610*.proto. Split out
+# from ZMK_PMW3610_STUDIO_RPC (which additionally implies CONFIG_ZMK_STUDIO,
+# unavailable on a split peripheral) so a split peripheral -- which has no
+# Studio of its own -- can still encode/decode these messages for relaying.
+# `select NANOPB` (+ the same `imply`s ZMK_STUDIO_RPC itself uses) directly,
+# rather than relying on CONFIG_ZMK_STUDIO_RPC to have pulled NANOPB in --
+# on a split peripheral, ZMK_STUDIO_RPC is never selected (ZMK_STUDIO only
+# `select`s it `if !ZMK_SPLIT || ZMK_SPLIT_ROLE_CENTRAL`), so without this
+# the nanopb runtime headers (pb.h) are unavailable even though nanopb code
+# generation itself (nanopb_generate_cpp in CMakeLists.txt) still runs.
+config ZMK_PMW3610_PROTOBUF
+    bool
+    select NANOPB
+    imply NANOPB_NO_ERRMSG
+    imply NANOPB_WITHOUT_64BIT
+    imply NANOPB_NO_ENCODE_SIZE_CHECK
 
 config ZMK_PMW3610_CUSTOM_SETTINGS
     bool "Enable PMW3610 runtime settings via zmk-feature-custom-settings"

@@ -6,6 +6,7 @@
 
 #define DT_DRV_COMPAT cormoran_pmw3610
 
+#include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/input/input.h>
@@ -682,6 +683,8 @@ static int pmw3610_init(const struct device *dev) {
     // init smart algorithm flag;
     data->sw_smart_flag = false;
 
+    pmw3610_settings_id_resolve(config->settings_id, config->dt_node_path, data->device_id);
+
     k_mutex_init(&data->lock);
 
     // Seed runtime config from Kconfig/DT defaults. When
@@ -840,6 +843,8 @@ static int pmw3610_pm_action(const struct device *dev, enum pm_device_action act
         .y_input_code = DT_PROP(DT_DRV_INST(n), y_input_code),                                     \
         .force_awake = DT_PROP(DT_DRV_INST(n), force_awake),                                       \
         .disable_burst_read = DT_PROP(DT_DRV_INST(n), disable_burst_read),                         \
+        .settings_id = DT_PROP_OR(DT_DRV_INST(n), settings_id, NULL),                              \
+        .dt_node_path = DT_NODE_PATH(DT_DRV_INST(n)),                                              \
     };                                                                                             \
     PM_DEVICE_DT_INST_DEFINE(n, pmw3610_pm_action);                                                \
     DEVICE_DT_INST_DEFINE(n, pmw3610_init, PM_DEVICE_DT_INST_GET(n), &data##n, &config##n,         \
@@ -897,6 +902,16 @@ bool pmw3610_is_ready(const struct device *dev) {
     }
     struct pixart_data *data = dev->data;
     return data->ready;
+}
+
+int pmw3610_get_device_id(const struct device *dev, char *buf, size_t buf_len) {
+    if (!dev || !buf || buf_len == 0) {
+        return -EINVAL;
+    }
+    struct pixart_data *data = dev->data;
+    strncpy(buf, data->device_id, buf_len - 1);
+    buf[buf_len - 1] = '\0';
+    return 0;
 }
 
 int pmw3610_get_init_error(const struct device *dev) {

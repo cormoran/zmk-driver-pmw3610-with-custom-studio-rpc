@@ -163,17 +163,18 @@ For more info on modules, you can read through through the [Zephyr modules page]
 ### Runtime settings (`cormoran__pmw3610` custom settings)
 
 With `CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS=y`, the following keys are
-registered (all public/unsecured, readable and writable over the generic
+registered **once per PMW3610 devicetree instance**, as `"<param>@<id>"`
+(all public/unsecured, readable and writable over the generic
 custom-settings Studio RPC subsystem provided by
 [zmk-feature-custom-settings](https://github.com/cormoran/zmk-feature-custom-settings)):
 
-| key | type | default | valid range |
+| param | type | default | valid range |
 | --- | --- | --- | --- |
-| `cpi` | int32 | 600 | 200 – 3200 |
+| `cpi` | int32 | this device's DT `cpi` property (600 if unset) | 200 – 3200 |
 | `swap_xy` | bool | `CONFIG_PMW3610_SWAP_XY` | — |
 | `invert_x` | bool | `CONFIG_PMW3610_INVERT_X` | — |
 | `invert_y` | bool | `CONFIG_PMW3610_INVERT_Y` | — |
-| `force_awake` | bool | `false` | — |
+| `force_awake` | bool | this device's DT `force-awake` property (`false` if unset) | — |
 | `smart_algorithm` | bool | `CONFIG_PMW3610_SMART_ALGORITHM` | — |
 | `run_downshift_ms` | int32 | `CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS` | 32 – 8160 |
 | `rest1_downshift_ms` | int32 | `CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS` | `16*sample` – `255*16*sample`, using the *default* `rest1_sample_ms` |
@@ -183,16 +184,25 @@ custom-settings Studio RPC subsystem provided by
 | `rest3_sample_ms` | int32 | `CONFIG_PMW3610_REST3_SAMPLE_TIME_MS` | 10 – 2550 |
 | `report_interval_min_ms` | int32 | `CONFIG_PMW3610_REPORT_INTERVAL_MIN` | 0 – 1000 |
 
+**`<id>`** is this device's `settings_id`, reported per-device in `GetInfo`
+(`DeviceInfo.settings_id`): the devicetree `settings-id` property if set
+(recommended, up to 8 ASCII characters, e.g. `settings-id = "trackball";`),
+otherwise a 4-hex-digit hash of the devicetree node's path (stable across
+reordering of sibling devicetree nodes, but not human-readable — set
+`settings-id` explicitly if you want a readable key, e.g. with more than one
+PMW3610 device in one firmware image). A single-sensor board without
+`settings-id` set ends up with keys like `cpi@a3f2`; with `settings-id =
+"trackball"` it would be `cpi@trackball`.
+
 Notes:
 
-- **`force_awake` default is always `false`**, regardless of any per-device
-  DT `force-awake;` property. A device with `force-awake;` set in DT boots
-  with it enabled, but as soon as `CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS` is
-  enabled, the setting's effective value (`false` unless you change it) is
-  applied during sensor init and overrides the DT default. If you want
-  force-awake on by default with custom settings enabled, either change a
-  persisted value once (it'll survive reboots), or set the `force_awake`
-  setting via Studio RPC / the settings export/import mechanism.
+- **Each device's settings are independent.** With two PMW3610 devices in
+  one firmware image (e.g. a split keyboard's central *and* peripheral each
+  having a sensor, or two sensors on one half), changing `cpi@<id>` for one
+  device does not affect the other's `cpi@<other-id>`.
+- `force_awake` and `cpi` default to **this device's own devicetree
+  properties** (`force-awake;` / `cpi = <...>;`), not a single value shared
+  by every device.
 - The `rest1_downshift_ms`/`rest2_downshift_ms` **range constraints are
   computed from the default sample time**, but the sensor's actual valid
   range at any given moment depends on the *current* `rest1_sample_ms` /
@@ -203,7 +213,8 @@ Notes:
 - Changes take effect immediately (pushed to the sensor over SPI as soon as
   it has finished async init) and are re-applied to all PMW3610 devices
   whenever any `cormoran__pmw3610` setting changes (save, discard, or
-  reset).
+  reset) — each device only ever reads its own `"<param>@<id>"` keys, so
+  this is harmless for devices unrelated to the change.
 - Settings persistence/export/import (`get`/`set`/`save`/`discard`/`reset`)
   is handled generically by zmk-feature-custom-settings' own Studio RPC
   subsystem, not duplicated here — see that module's README/web app for the
@@ -324,10 +335,92 @@ requires ZMK Studio to be unlocked — see "Security" above — but treat access
 to it like access to a debug/JTAG interface regardless: fine for your own
 trusted host, not something to expose over an untrusted transport.
 
+### Split keyboards / multiple sensors (`source`, `CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY`)
+
+**Multiple PMW3610 devices in one firmware image** (e.g. two sensors on the
+same half) already work with no extra configuration: each devicetree
+instance gets its own settings (see "Runtime settings" above) and its own
+entry in `GetInfo`'s `devices` list (`device_index`/`settings_id`).
+
+**Reaching a sensor on a split keyboard's *peripheral* half** additionally
+requires `CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY=y` on **both** halves (depends
+on ZMK's `CONFIG_ZMK_SPLIT_RELAY_EVENT`) plus, since the largest relayed
+message needs more room than the framework's 128-byte default,
+`CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN=240`. Every request
+(`GetInfo`/`ReadDiagnostics`/`ReadRegister`/`WriteRegister`/`CaptureFrame`/
+`GetFrameChunk`/`SetFrameStream`) has a `source` field: `0` (the default)
+targets local devices, `1` the first peripheral. Since relaying is
+inherently asynchronous, a relayed request's RPC call returns immediately
+with a `DeferredResponse{request_id}`; the real answer arrives later as a
+`PeripheralResponse{source, request_id, response}` Studio notification.
+
+```jsonc
+// GetInfo targeting the first split peripheral's own devices
+{ "getInfo": { "source": 1 } }
+// -> { "deferred": { "requestId": 7 } }   // immediate
+// ... later, as a notification:
+// { "peripheralResponse": { "source": 1, "requestId": 7,
+//     "response": { "getInfo": { "devices": [ ... ] } } } }
+```
+
+**Frame streaming from a peripheral's sensor** works the same way:
+`SetFrameStream{source: 1, enable: true, deviceIndex: 0}` starts the
+existing capture loop on the peripheral, and each chunk relays back as a
+`FrameStreamChunk` notification with `source` filled in (0 for a locally
+streamed frame). `CaptureFrame`/`GetFrameChunk` against a peripheral work
+the same as their local form, just via the deferred/notification pattern
+above instead of a synchronous response.
+
+The underlying relay transport broadcasts a request to *every* connected
+peripheral rather than addressing one specifically (each one's answer still
+arrives correctly tagged with its own `source`) — fine for the common
+single-peripheral split, but means a multi-peripheral build gets one
+`PeripheralResponse`/`FrameStreamChunk` per peripheral for the same
+`request_id`/stream.
+
+**Listing every PMW3610 across the whole keyboard**: there is no API to ask
+ZMK's split transport "which peripherals are currently connected" (nothing
+this module could hook into anyway), so `GetInfo` instead accepts the
+sentinel `source = 0xFFFFFFFF`: it answers with this device's own local
+devices synchronously (exactly like `source: 0`), and — if relaying is
+enabled — the *same* request is broadcast to every connected peripheral,
+each answering independently as its own `PeripheralResponse` (carrying
+`GetInfoResponse.relay_request_id` so the caller can correlate them). The
+web UI's Sensor card has a "Scan All Sources" button that does exactly
+this, collecting peripheral answers for ~2s and listing a row per source.
+
+```jsonc
+// List every PMW3610 across the whole keyboard
+{ "getInfo": { "source": 4294967295 } }
+// -> { "getInfo": { "devices": [ ... local ... ], "relayRequestId": 3 } }  // immediate
+// ... then zero or more notifications, one per connected peripheral:
+// { "peripheralResponse": { "source": 1, "requestId": 3,
+//     "response": { "getInfo": { "devices": [ ... ] } } } }
+```
+
+This has been build-tested (both roles compile, see
+`tests/zmk-config/build.yaml`'s `pmw3610_split_*` artifacts) and the
+peripheral-side request execution (including a CaptureFrame call and the
+genuinely-unsupported-request-kind fallback) has a native_sim self-test
+(`tests/split_peripheral`), but **not yet validated against real split
+hardware** — no split-capable board pair was available while developing
+this feature. The central-side broadcast dispatch additionally has a
+self-test (`CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY_TEST` on the
+`pmw3610_split_central` build), but only compile/link-verified: it needs
+ZMK's real BLE split transport, which native_sim cannot provide without a
+working Bluetooth stack.
+
 ### Web UI
 
 See [web/README.md](./web/README.md) for web UI development instructions,
-including the settings panel, diagnostics polling, and frame viewer.
+including the settings panel, diagnostics polling, and frame viewer. The
+Sensor and Frame Viewer cards each have a "Split source" input (0 = local,
+matching the proto default); a relayed request's `DeferredResponse` is
+awaited transparently behind the scenes (`web/src/relay.ts`) so the rest of
+the UI code doesn't need to special-case it. The generic settings panel
+(`cormoran_custom_settings`, a separate subsystem provided by
+zmk-feature-custom-settings) does not have a source selector yet -- its
+calls always target `source: 0` (local devices).
 
 ### Publishing Web UI
 

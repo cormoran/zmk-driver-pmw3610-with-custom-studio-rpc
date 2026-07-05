@@ -2,7 +2,24 @@ syntax = "proto3";
 
 package cormoran.pmw3610;
 
-message GetInfoRequest {}
+// `source` addresses which firmware image's local devices a request targets:
+// 0 (the default, omitted) means this device (the Studio RPC central
+// itself); a nonzero value relays the request to a split peripheral (see
+// DESIGN.md Phase F) -- requires CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY on both
+// halves.
+//
+// GetInfo additionally accepts the sentinel `source = 0xFFFFFFFF` ("list
+// every PMW3610 across the whole keyboard"): the response reports this
+// device's own local devices synchronously (exactly like `source = 0`,
+// since there is no other way to enumerate which split peripherals are
+// currently connected -- ZMK's split transport doesn't expose that to
+// modules), and -- if CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY is enabled -- the
+// same GetInfo request is *also* broadcast to every connected peripheral,
+// each answering independently, asynchronously, as its own
+// PeripheralResponse notification (source = that peripheral's slot,
+// request_id = GetInfoResponse.relay_request_id). No other request kind
+// supports this sentinel.
+message GetInfoRequest { uint32 source = 1; }
 
 message RuntimeConfig {
     uint32 cpi = 1;
@@ -26,11 +43,34 @@ message DeviceInfo {
     uint32 revision_id = 3;
     int32 init_error = 4;
     RuntimeConfig runtime_config = 5;
+    // Index of this device within its source (see GetInfoRequest.source),
+    // usable as ReadDiagnostics/ReadRegister/WriteRegister/CaptureFrame's
+    // device_index against the same source.
+    uint32 device_index = 6;
+    // Stable per-device id (devicetree `settings-id` property, or a 4-hex
+    // hash of the devicetree node path if absent) -- see
+    // pmw3610_settings_id.h. Used to build this device's per-device custom
+    // setting keys ("<param>@<id>") in the cormoran__pmw3610 custom-settings
+    // subsystem, and lets the web UI group settings by device.
+    string settings_id = 7;
 }
 
-message GetInfoResponse { repeated DeviceInfo devices = 1; }
+message GetInfoResponse {
+    repeated DeviceInfo devices = 1;
+    // Nonzero only when the request's `source` was the 0xFFFFFFFF
+    // broadcast sentinel and relaying is enabled: the request_id that any
+    // further peripheral answers (as PeripheralResponse notifications)
+    // will carry, so the caller can correlate them to this call. 0 means
+    // no broadcast was made (a plain local/single-peripheral GetInfo, or
+    // relaying is unavailable) -- devices above is the complete answer.
+    uint32 relay_request_id = 2;
+}
 
-message ReadDiagnosticsRequest { uint32 device_index = 1; }
+message ReadDiagnosticsRequest {
+    uint32 device_index = 1;
+    // See GetInfoRequest.source.
+    uint32 source = 2;
+}
 
 message ReadDiagnosticsResponse {
     uint32 squal = 1;
@@ -43,6 +83,8 @@ message ReadDiagnosticsResponse {
 message ReadRegisterRequest {
     uint32 device_index = 1;
     uint32 address = 2;
+    // See GetInfoRequest.source.
+    uint32 source = 3;
 }
 
 message ReadRegisterResponse { uint32 value = 1; }
@@ -56,6 +98,8 @@ message WriteRegisterRequest {
     uint32 device_index = 1;
     uint32 address = 2;
     uint32 value = 3;
+    // See GetInfoRequest.source.
+    uint32 source = 4;
 }
 
 message WriteRegisterResponse {}
@@ -84,6 +128,8 @@ message CaptureFrameRequest {
     // skip_pixel_grab_reset) were removed when the official datasheet
     // procedure replaced the guessed convention.
     reserved 4, 5, 6;
+    // See GetInfoRequest.source.
+    uint32 source = 7;
 }
 
 message CaptureFrameResponse {
@@ -107,6 +153,8 @@ message CaptureFrameResponse {
 message GetFrameChunkRequest {
     uint32 frame_id = 1;
     uint32 offset = 2;
+    // See GetInfoRequest.source.
+    uint32 source = 3;
 }
 
 message GetFrameChunkResponse {
@@ -130,6 +178,8 @@ message SetFrameStreamRequest {
     bool enable = 2;
     uint32 pixel_count = 3;         // 0 = driver default, same as CaptureFrameRequest.
     uint32 max_invalid_retries = 4; // 0 = driver default, same as CaptureFrameRequest.
+    // See GetInfoRequest.source.
+    uint32 source = 5;
 }
 
 message SetFrameStreamResponse {
@@ -151,6 +201,12 @@ message Request {
 
 message ErrorResponse { string message = 1; }
 
+// Returned immediately in place of the real response when a request's
+// `source` targets a split peripheral (relaying is inherently
+// asynchronous -- see DESIGN.md Phase F): the real Response for
+// `request_id` arrives later as a `PeripheralResponse` Notification.
+message DeferredResponse { uint32 request_id = 1; }
+
 message Response {
     oneof response_type {
         ErrorResponse error = 1;
@@ -161,7 +217,36 @@ message Response {
         CaptureFrameResponse capture_frame = 6;
         GetFrameChunkResponse get_frame_chunk = 7;
         SetFrameStreamResponse set_frame_stream = 8;
+        DeferredResponse deferred = 9;
     }
+}
+
+// The real response to a request that returned a DeferredResponse, once the
+// targeted peripheral's answer has relayed back to the central. Raised as a
+// custom Studio notification (not a Request/Response), matching
+// FrameStreamChunk's pattern.
+message PeripheralResponse {
+    // Matches the source given in the original request (1 = first
+    // peripheral, etc; never 0 -- local requests are answered synchronously
+    // and never produce a DeferredResponse/PeripheralResponse).
+    uint32 source = 1;
+    uint32 request_id = 2;
+    Response response = 3;
+}
+
+// Wire format for relaying a Request to a split peripheral and its Response
+// back, carried as the opaque payload of this module's own
+// zmk_pmw3610_relay_request/zmk_pmw3610_relay_response ZMK split relay
+// events (see src/split/pmw3610_relay.c) -- NOT part of the Request/Response
+// oneofs above, and never sent directly over the Studio RPC transport.
+message RelayRequest {
+    uint32 request_id = 1;
+    Request request = 2;
+}
+
+message RelayResponse {
+    uint32 request_id = 1;
+    Response response = 2;
 }
 
 // One 128-byte-or-less chunk of a frame captured while streaming
@@ -183,8 +268,16 @@ message FrameStreamChunk {
     // meaning as CaptureFrameResponse.complete); repeated on every chunk of
     // the same frame.
     bool complete = 5;
+    // Which source (0 = local/central, N = peripheral N) streamed this
+    // frame -- set by the central when re-raising a stream chunk relayed up
+    // from a peripheral (see DESIGN.md Phase F); always 0 for a locally
+    // streamed frame.
+    uint32 source = 6;
 }
 
 message Notification {
-    oneof notification_type { FrameStreamChunk frame_stream_chunk = 1; }
+    oneof notification_type {
+        FrameStreamChunk frame_stream_chunk = 1;
+        PeripheralResponse peripheral_response = 2;
+    }
 }

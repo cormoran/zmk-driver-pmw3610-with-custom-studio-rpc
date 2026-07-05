@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <zephyr/device.h>
+#include <cormoran/pmw3610/pmw3610_settings_id.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,6 +41,22 @@ bool pmw3610_is_ready(const struct device *dev);
 
 /** @brief Last error code observed during async init (0 = no error). */
 int pmw3610_get_init_error(const struct device *dev);
+
+/** @brief Get this device's stable per-device settings id.
+ *
+ * Resolved once at pmw3610_init() from the devicetree `settings-id` property
+ * (used verbatim, truncated to PMW3610_SETTINGS_ID_MAX_LEN) or, when absent,
+ * a 4-hex-digit hash of the devicetree node's full path (stable across
+ * devicetree reordering of sibling nodes). Used to build this device's
+ * per-device custom setting keys ("<param>@<id>") and reported in GetInfo.
+ *
+ * @param dev PMW3610 device.
+ * @param buf Output buffer, NUL-terminated on success.
+ * @param buf_len Capacity of buf, in bytes (should be at least
+ *   PMW3610_SETTINGS_ID_BUF_SIZE to avoid truncation).
+ * @return 0 on success, -EINVAL for a NULL dev/buf or zero buf_len.
+ */
+int pmw3610_get_device_id(const struct device *dev, char *buf, size_t buf_len);
 
 /** @brief Read a single register over SPI.
  *
