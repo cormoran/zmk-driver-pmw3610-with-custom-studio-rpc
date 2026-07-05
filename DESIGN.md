@@ -586,8 +586,7 @@ Everything below was design; implementation status per stage (F.6):
   (`zmk_pmw3610_relay_request`/`_response`, identifiers `pmq`/`pmp`) and
   the Kconfig/nanopb decoupling (`CONFIG_ZMK_PMW3610_PROTOBUF`, needed
   because a peripheral has no `ZMK_STUDIO_RPC` to `select NANOPB` for it)
-  follow exactly the F.0 design below. CaptureFrame/GetFrameChunk/
-  SetFrameStream do not relay yet (F-d).
+  follow exactly the F.0 design below.
   **Real constraint found while implementing** (not anticipated in the
   original F.2 design): ZMK's split relay event wire header
   (`relay_event_header.event_data_size`) is a single `uint8_t`, hard-capping
@@ -613,25 +612,62 @@ Everything below was design; implementation status per stage (F.6):
   proving both roles compile as real ARM firmware; `python3 -m unittest`
   (build + native_sim + this new test) and web unit tests/lint/build all
   still pass.
-- **F-d + F-e (frame capture/streaming over relay, web split UI) — not yet
-  implemented.** No split-capable hardware (two physical halves) is
-  available in this environment to validate a *real* relay round-trip
-  end-to-end (native_sim can only prove the peripheral-side executor logic
-  in isolation, as F-c's test does — it cannot exercise the actual BLE
-  transport), so streaming (higher risk: ongoing per-chunk state, lock/
-  disconnect stop paths) and the web UI's source-addressed device model are
-  left as design (below) for a session with that hardware.
+- **F-d (frame capture/streaming over relay) — implemented.** `CaptureFrame`/
+  `GetFrameChunk`/`SetFrameStream` gained a `source` field and now route
+  through the same local-vs-relay dispatch as the other four request kinds.
+  The frame capture/streaming handlers (static frame buffer, `frame_id`
+  counter, the streaming work-queue loop) moved from
+  `src/studio/pmw3610_handler.c` into `pmw3610_request_exec.c` too, so a
+  split peripheral (no Studio of its own) can execute them locally when
+  relayed. `FrameStreamChunk` gained a `source` field (0 = streamed
+  locally); a peripheral's stream chunks relay up as a **new**
+  one-directional (peripheral→central) relay event,
+  `zmk_pmw3610_relay_notification` (identifier `pmn`, carrying an
+  already-encoded `Notification`) via a new `pmw3610_relay_notify()` entry
+  point, and the central re-raises it as the real Studio notification with
+  `source` filled in — the same pattern as `PeripheralResponse`, just for
+  an unsolicited (not request/response-shaped) notification instead. Two
+  new stop-streaming safety nets, split by role (both only meaningful on
+  one side): the central's existing Studio-lock-triggered stop stays
+  central-only (`#if !PMW3610_IS_SPLIT_PERIPHERAL`); a new
+  peripheral-only listener on `zmk_split_peripheral_status_changed` stops
+  an active stream when the split link disconnects (`#if
+  PMW3610_IS_SPLIT_PERIPHERAL`), matching the design's "peripheral
+  force-stops on disconnect" plan. `pmw3610_handler.c` shrank to just
+  decode → route (source==0 → `pmw3610_request_exec_handle()`, else →
+  `pmw3610_relay_dispatch_request()`) → return — no request-kind-specific
+  logic left in it at all.
+  Verified: `tests/split_peripheral`'s self-test now also exercises a
+  relayed `CaptureFrame` against zero local devices (still an
+  ErrorResponse, but for "no such device" rather than "unsupported kind" —
+  a genuinely-unsupported/malformed relayed request, tested separately via
+  an unset `request_type`, is what now exercises that fallback path); all 8
+  `west zmk-build` artifacts (including the split roles, both of which now
+  compile the frame logic) and the full `python3 -m unittest` +
+  web unit tests/lint/build all still pass. The largest relayed message
+  (`Notification` wrapping a `PeripheralResponse` for a two-device
+  `GetInfoResponse`, ~231 bytes) needed
+  `CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN` raised from 224 to 240 (still
+  comfortably under the 255-byte hard ceiling).
+- **F-e (web UI plumbing for `source`) — not yet implemented.** The web UI
+  still always calls with `source: 0` (local devices only); adding a
+  device/source selector, the async deferred-response correlation helper,
+  and per-source frame stream demuxing described in F.4 below is left for
+  later.
 
 ### Hardware validation status (2026-07)
 
 No PMW3610 sensor or split-capable board pair was attached in this
-environment. F-a/F-b/F-c were validated at the build/native_sim/web-test
-level only (see above) — not against a real sensor's persisted `cpi@<id>`
-value across reboot, nor a real two-half split link exercising the actual
-BLE relay transport (only the peripheral-side executor logic was exercised,
-via a local self-test bypassing the transport). Re-run the "Validation plan
-(hardware)" steps below (extended with a second device / settings-id / a
-real second half) once hardware is available.
+environment. F-a through F-d were validated at the build/native_sim/
+web-test level only (see above) — not against a real sensor's persisted
+`cpi@<id>` value across reboot, nor a real two-half split link exercising
+the actual BLE relay transport (only the peripheral-side executor logic was
+exercised, via a local self-test bypassing the transport — this covers
+correctness of "given this decoded request, is the local execution/response
+right", not the wire relay itself, BLE MTU chunking of a >MTU relay event,
+or real-world timing/loss behavior). Re-run the "Validation plan (hardware)"
+steps below (extended with a second device / settings-id / a real second
+half / a real SetFrameStream from a peripheral) once hardware is available.
 
 Facts about the dependencies below were verified against the checked-out
 sources (paths cited).

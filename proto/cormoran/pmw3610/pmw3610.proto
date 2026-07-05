@@ -6,9 +6,7 @@ package cormoran.pmw3610;
 // 0 (the default, omitted) means this device (the Studio RPC central
 // itself); a nonzero value relays the request to a split peripheral (see
 // DESIGN.md Phase F) -- requires CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY on both
-// halves. Only GetInfo/ReadDiagnostics/ReadRegister/WriteRegister support
-// relaying so far; CaptureFrame/GetFrameChunk/SetFrameStream do not have a
-// `source` field yet and always target local devices.
+// halves.
 message GetInfoRequest { uint32 source = 1; }
 
 message RuntimeConfig {
@@ -109,6 +107,8 @@ message CaptureFrameRequest {
     // skip_pixel_grab_reset) were removed when the official datasheet
     // procedure replaced the guessed convention.
     reserved 4, 5, 6;
+    // See GetInfoRequest.source.
+    uint32 source = 7;
 }
 
 message CaptureFrameResponse {
@@ -132,6 +132,8 @@ message CaptureFrameResponse {
 message GetFrameChunkRequest {
     uint32 frame_id = 1;
     uint32 offset = 2;
+    // See GetInfoRequest.source.
+    uint32 source = 3;
 }
 
 message GetFrameChunkResponse {
@@ -155,6 +157,8 @@ message SetFrameStreamRequest {
     bool enable = 2;
     uint32 pixel_count = 3;         // 0 = driver default, same as CaptureFrameRequest.
     uint32 max_invalid_retries = 4; // 0 = driver default, same as CaptureFrameRequest.
+    // See GetInfoRequest.source.
+    uint32 source = 5;
 }
 
 message SetFrameStreamResponse {
@@ -243,6 +247,11 @@ message FrameStreamChunk {
     // meaning as CaptureFrameResponse.complete); repeated on every chunk of
     // the same frame.
     bool complete = 5;
+    // Which source (0 = local/central, N = peripheral N) streamed this
+    // frame -- set by the central when re-raising a stream chunk relayed up
+    // from a peripheral (see DESIGN.md Phase F); always 0 for a locally
+    // streamed frame.
+    uint32 source = 6;
 }
 
 message Notification {

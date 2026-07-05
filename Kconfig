@@ -109,18 +109,19 @@ config ZMK_PMW3610_STUDIO_RPC
       info and diagnostics. Works with zero PMW3610 devices present (e.g.
       native_sim), so it does not depend on CONFIG_PMW3610 directly.
 
-if ZMK_PMW3610_STUDIO_RPC
-
+# Not scoped `if ZMK_PMW3610_STUDIO_RPC`: the frame capture/streaming
+# handlers that use this buffer (src/studio/pmw3610_request_exec.c) also
+# compile under CONFIG_ZMK_PMW3610_SPLIT_RPC_RELAY alone (a split peripheral
+# has no Studio of its own -- see DESIGN.md Phase F).
 config ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE
     int "Static frame capture buffer size (pixels/bytes)"
     default 484
+    depends on ZMK_PMW3610_PROTOBUF
     help
       Size of the static frame buffer used by the CaptureFrame/GetFrameChunk
-      Studio RPC handlers (one byte per pixel). The default (484 = 22x22)
-      matches the driver's default capture pixel count. A CaptureFrame
-      request's pixel_count is clamped to this size.
-
-endif # ZMK_PMW3610_STUDIO_RPC
+      handlers (one byte per pixel). The default (484 = 22x22) matches the
+      driver's default capture pixel count. A CaptureFrame request's
+      pixel_count is clamped to this size.
 
 config ZMK_PMW3610_SPLIT_RPC_RELAY
     bool "Relay PMW3610 Studio RPC to split peripherals"
@@ -129,16 +130,17 @@ config ZMK_PMW3610_SPLIT_RPC_RELAY
     help
       Enable on BOTH halves of a split keyboard to reach PMW3610 devices
       living on a split peripheral through the central's cormoran__pmw3610
-      Studio RPC subsystem: GetInfo/ReadDiagnostics/ReadRegister/
-      WriteRegister requests with a nonzero `source` are relayed to the
-      matching peripheral over CONFIG_ZMK_SPLIT_RELAY_EVENT, and the
-      response arrives back as a PeripheralResponse Studio notification
-      (relaying is asynchronous, unlike a local request). CaptureFrame/
-      GetFrameChunk/SetFrameStream do not support relaying yet. Increase
-      CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN if your build fails a
-      BUILD_ASSERT about the relayed request/response payload size (a
-      GetInfoResponse for multiple peripheral devices needs more room than
-      the framework's default).
+      Studio RPC subsystem: any request (GetInfo/ReadDiagnostics/
+      ReadRegister/WriteRegister/CaptureFrame/GetFrameChunk/SetFrameStream)
+      with a nonzero `source` is relayed to the matching peripheral over
+      CONFIG_ZMK_SPLIT_RELAY_EVENT, and the response arrives back as a
+      PeripheralResponse Studio notification (relaying is asynchronous,
+      unlike a local request). A peripheral's SetFrameStream chunks relay
+      back the same way, as FrameStreamChunk notifications with `source`
+      filled in. Increase CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN if your
+      build fails a BUILD_ASSERT about the relayed request/response payload
+      size (a GetInfoResponse for multiple peripheral devices needs more
+      room than the framework's default).
       Note: the underlying split relay event transport broadcasts to every
       connected peripheral, not to one addressed peripheral -- with more
       than one peripheral, every peripheral answers every relayed request
