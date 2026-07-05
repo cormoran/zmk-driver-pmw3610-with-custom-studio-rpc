@@ -161,6 +161,8 @@ static const struct zmk_custom_setting_constraint pmw3610_report_interval_constr
 };
 
 #define PMW3610_SETTING_INT32(_name, _key, _default, _constraint)                                  \
+    static const struct zmk_custom_setting_value _name##_default_value = {                         \
+        .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = (_default)};                   \
     STRUCT_SECTION_ITERABLE(zmk_custom_setting, _name) = {                                         \
         .custom_subsystem_id = PMW3610_SETTINGS_SUBSYSTEM_ID,                                      \
         .key = _key,                                                                               \
@@ -171,10 +173,13 @@ static const struct zmk_custom_setting_constraint pmw3610_report_interval_constr
         .write_permission = ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,                                \
         .constraints = (_constraint),                                                              \
         .constraints_count = ARRAY_SIZE(_constraint),                                              \
-        .default_value = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = (_default)}, \
+        .default_value = &_name##_default_value,                                                   \
+        .temp_slot = -1,                                                                           \
     }
 
 #define PMW3610_SETTING_BOOL(_name, _key, _default)                                                \
+    static const struct zmk_custom_setting_value _name##_default_value = {                         \
+        .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL, .bool_value = (_default)};                      \
     STRUCT_SECTION_ITERABLE(zmk_custom_setting, _name) = {                                         \
         .custom_subsystem_id = PMW3610_SETTINGS_SUBSYSTEM_ID,                                      \
         .key = _key,                                                                               \
@@ -185,7 +190,8 @@ static const struct zmk_custom_setting_constraint pmw3610_report_interval_constr
         .write_permission = ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,                                \
         .constraints = pmw3610_no_constraint,                                                      \
         .constraints_count = ARRAY_SIZE(pmw3610_no_constraint),                                    \
-        .default_value = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL, .bool_value = (_default)},   \
+        .default_value = &_name##_default_value,                                                   \
+        .temp_slot = -1,                                                                           \
     }
 
 /* DT default cpi is 600 (dts/bindings/cormoran,pmw3610.yml). Devices with a
