@@ -86,10 +86,15 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 // FRAME_GRAB (0x36) enable bit ("FG_EN").
 #define PMW3610_FRAME_GRAB_ENABLE 0x80
 // Wait after arming FG_EN for one fresh frame to latch before the burst
-// read. The Arduino reference uses a fixed 10ms; hardware validation
-// (DESIGN.md G.6) tunes this down toward the run-mode frame period
-// (~4ms) -- kept as a single tunable macro for that purpose.
+// read. The Arduino reference uses a fixed 10ms. This is the driver default
+// when the request does not override it (see the max_invalid_retries
+// reinterpretation in pmw3610_frame_capture_read()): the FG_EN-to-fresh-
+// frame latency is up to ~2 run-mode frame periods, so 10ms is a safe
+// starting point. Overridable per capture as the primary fps/reliability
+// knob (DESIGN.md G.6).
 #define PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MS 10
+// Clamp range for the request-supplied post-arm wait override.
+#define PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MAX_MS 100
 
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
@@ -1432,8 +1437,9 @@ int pmw3610_frame_capture_begin(const struct device *dev,
 /* Single-helper "arm" for the burst FRAME_GRAB read, re-run every frame
  * (matching the Arduino reference sketch -- see DESIGN.md Phase G.2's open
  * "arm-once vs re-arm" experiment for hardware validation to settle
- * later). DESIGN.md Phase G.1 steps 1-4; caller holds data->lock. */
-static int pmw3610_frame_capture_arm_burst(const struct device *dev) {
+ * later). DESIGN.md Phase G.1 steps 1-4; caller holds data->lock.
+ * `post_arm_wait_ms` is the fresh-frame-latch wait (see the macro). */
+static int pmw3610_frame_capture_arm_burst(const struct device *dev, uint16_t post_arm_wait_ms) {
     int err =
         pmw3610_write_reg(dev, PMW3610_REG_PERFORMANCE, PMW3610_FRAME_GRAB_PERFORMANCE_FORCE_RUN);
     if (err) {
@@ -1460,7 +1466,7 @@ static int pmw3610_frame_capture_arm_burst(const struct device *dev) {
         return err;
     }
 
-    k_sleep(K_MSEC(PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MS));
+    k_sleep(K_MSEC(post_arm_wait_ms));
     return 0;
 }
 
@@ -1608,7 +1614,16 @@ int pmw3610_frame_capture_read(const struct device *dev,
 
     if (!config->disable_burst_read) {
         result->format = PMW3610_PIXEL_FORMAT_RAW8;
-        err = pmw3610_frame_capture_arm_burst(dev);
+        /* Burst mode has no per-pixel ready handshake, so max_invalid_retries
+         * (the per-pixel-wait knob for the PIXEL_GRAB path) is meaningless
+         * here and is reinterpreted as a post-arm-wait override in ms -- the
+         * primary fps/reliability knob (DESIGN.md G.6). 0 = driver default. */
+        uint16_t post_arm_wait_ms = PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MS;
+        if (params && params->max_invalid_retries != 0) {
+            post_arm_wait_ms = CLAMP(params->max_invalid_retries, 1,
+                                     PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MAX_MS);
+        }
+        err = pmw3610_frame_capture_arm_burst(dev, post_arm_wait_ms);
         if (!err) {
             err = pmw3610_burst_read_frame(dev, buf, pixel_count);
             if (!err) {
