@@ -21,6 +21,22 @@ package cormoran.pmw3610;
 // supports this sentinel.
 message GetInfoRequest { uint32 source = 1; }
 
+// Discriminates the byte format of raw pixel data returned by
+// CaptureFrame/GetFrameChunk/FrameStreamChunk. Default (0) is PG7, the
+// original per-pixel Pixel_Grab byte format, so old clients/firmware that
+// never set this field stay wire-compatible.
+enum PixelFormat {
+    // Per-pixel Pixel_Grab byte: bit7 = PG_VALID, bits[6:0] = pixel value
+    // (see CaptureFrameRequest doc). Produced by the 3-wire fallback path
+    // (disable-burst-read) and by any firmware built before this field
+    // existed (default value).
+    PIXEL_FORMAT_PG7 = 0;
+    // Full 8-bit pixel value with no per-pixel validity bit, as returned by
+    // the FRAME_GRAB burst read (register 0x36/0x12; see docs/pmw3610.md
+    // "Frame Capture burst"). Produced by the 4-wire burst path.
+    PIXEL_FORMAT_RAW8 = 1;
+}
+
 message RuntimeConfig {
     uint32 cpi = 1;
     bool swap_xy = 2;
@@ -147,6 +163,9 @@ message CaptureFrameResponse {
     // Wall-clock duration of the capture procedure (arm sequence through
     // the completion check), in milliseconds.
     uint32 duration_ms = 5;
+    // Byte format of `data`/GetFrameChunk's bytes for this frame. Default
+    // (0 = PIXEL_FORMAT_PG7) keeps old clients working unmodified.
+    PixelFormat format = 6;
 }
 
 // Fetch a chunk of a previously captured frame's pixel bytes.
@@ -273,6 +292,8 @@ message FrameStreamChunk {
     // from a peripheral (see DESIGN.md Phase F); always 0 for a locally
     // streamed frame.
     uint32 source = 6;
+    // Byte format of `data` for this frame (see CaptureFrameResponse.format).
+    PixelFormat format = 7;
 }
 
 message Notification {
