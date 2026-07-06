@@ -142,3 +142,28 @@ int pmw3610_capture_frame(const struct device *dev,
     }
     return -ENODEV;
 }
+
+int pmw3610_frame_capture_begin(const struct device *dev,
+                                const struct pmw3610_frame_capture_params *params) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(params);
+    return -ENODEV;
+}
+
+int pmw3610_frame_capture_read(const struct device *dev,
+                               const struct pmw3610_frame_capture_params *params, uint8_t *buf,
+                               uint16_t buf_len, struct pmw3610_frame_capture_result *result) {
+    ARG_UNUSED(dev);
+    ARG_UNUSED(params);
+    ARG_UNUSED(buf);
+    ARG_UNUSED(buf_len);
+    if (result) {
+        *result = (struct pmw3610_frame_capture_result){0};
+    }
+    return -ENODEV;
+}
+
+int pmw3610_frame_capture_end(const struct device *dev) {
+    ARG_UNUSED(dev);
+    return -ENODEV;
+}

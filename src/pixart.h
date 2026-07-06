@@ -83,6 +83,16 @@ struct pixart_data {
      * disabling the motion IRQ. */
     bool capture_active;
 
+    /* Set between a successful pmw3610_frame_capture_begin() and the
+     * matching pmw3610_frame_capture_end() (guarded by `lock`): the sensor
+     * has been forced into run mode and the test clock enabled for a
+     * capture session, so pmw3610_frame_capture_read() can skip re-doing
+     * that (slow, up to ~700ms from a deep rest mode) setup on every frame
+     * of a streamed capture. Distinct from capture_active, which is set for
+     * the whole begin..end window (including this flag's window) and used
+     * by pmw3610_report_data() to avoid interleaving SPI transactions. */
+    bool capture_mode_active;
+
     /* Resolved once in pmw3610_init() from config->settings_id/dt_node_path
      * (see pmw3610_settings_id_resolve()) -- stable per-device id used to
      * build this device's custom setting keys and reported in GetInfo. */
