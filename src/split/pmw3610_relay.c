@@ -51,6 +51,31 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 #include <zmk/event_manager.h>
+#include <zmk/workqueue.h>
+
+/* Every listener below is invoked synchronously on whichever thread ZMK core
+ * happens to dispatch relay/split events from -- the system workqueue on
+ * both the peripheral (split_svc_relay_event_from_central_work,
+ * app/src/split/bluetooth/service.c) and the central
+ * (peripheral_event_work, app/src/split/bluetooth/central.c). protobuf
+ * decode/exec/encode for this subsystem's largest messages (~230 bytes) adds
+ * enough stack depth through nanopb + pmw3610_request_exec_handle() +
+ * (peripheral only) ZMK core's own relay-out path to overflow the system
+ * workqueue's default stack -- confirmed on real hardware (MPU fault / stack
+ * overflow) with only CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN=240 in play, no
+ * larger devices_count and no other system workqueue user competing for that
+ * stack at the same moment. Growing CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE
+ * "fixes" that, but bloats every other system workqueue consumer's headroom
+ * requirement and lets a slow protobuf pass (or, worse, frame streaming's
+ * ~2s-per-frame capture loop) block unrelated system workqueue work
+ * (BLE housekeeping, HID reports, keyscan-deferred work, ...) system-wide.
+ * Instead, every entry point below re-dispatches its own work onto ZMK
+ * core's dedicated low-priority workqueue (zmk_workqueue_lowprio_work_q(),
+ * app/src/workqueue.c -- already used by ZMK core itself for exactly this
+ * reason, e.g. gatt_rpc_transport.c's notify_tx_work) before doing any
+ * decode/exec/encode, so only CONFIG_ZMK_LOW_PRIORITY_THREAD_STACK_SIZE (its
+ * own dedicated stack, shared only with other deliberately-deferred,
+ * tolerant-of-latency ZMK work) needs to accommodate it. */
 
 /* ZMK_RELAY_EVENT_CENTRAL_TO_PERIPHERAL() (invoked below) expands to a call
  * to zmk_split_central_send_relay_event() but -- unlike the peripheral
@@ -188,26 +213,45 @@ static int pmw3610_relay_exec_request(const uint8_t *payload, size_t size,
 
 #if !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 
-static int on_pmw3610_relay_request(const zmk_event_t *eh) {
-    const struct zmk_pmw3610_relay_request *ev = as_zmk_pmw3610_relay_request(eh);
-    if (!ev) {
-        return 0;
-    }
+/* Single static buffer/work item: the relay bridge already assumes one
+ * in-flight relayed request at a time (matches the single-buffer/mutex
+ * pattern used for notifications elsewhere in this file) -- central awaits
+ * a DeferredResponse before a Studio client can issue another relayed call. */
+static uint8_t relay_request_work_payload[PMW3610_RELAY_REQUEST_PAYLOAD_MAX_SIZE];
+static size_t relay_request_work_payload_size;
+
+static void relay_request_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
 
     cormoran_pmw3610_RelayResponse relay_resp;
-    if (pmw3610_relay_exec_request(ev->payload, ev->size, &relay_resp) < 0) {
-        return 0;
+    if (pmw3610_relay_exec_request(relay_request_work_payload, relay_request_work_payload_size,
+                                   &relay_resp) < 0) {
+        return;
     }
 
     struct zmk_pmw3610_relay_response resp_event = {.source = ZMK_RELAY_EVENT_SOURCE_SELF};
     pb_ostream_t ostream = pb_ostream_from_buffer(resp_event.payload, sizeof(resp_event.payload));
     if (!pb_encode(&ostream, cormoran_pmw3610_RelayResponse_fields, &relay_resp)) {
         LOG_WRN("Failed to encode pmw3610 relay response: %s", PB_GET_ERROR(&ostream));
-        return 0;
+        return;
     }
     resp_event.size = (uint16_t)ostream.bytes_written;
 
     raise_zmk_pmw3610_relay_response(resp_event);
+}
+
+static K_WORK_DEFINE(relay_request_work, relay_request_work_handler);
+
+static int on_pmw3610_relay_request(const zmk_event_t *eh) {
+    const struct zmk_pmw3610_relay_request *ev = as_zmk_pmw3610_relay_request(eh);
+    if (!ev) {
+        return 0;
+    }
+
+    size_t size = MIN(ev->size, sizeof(relay_request_work_payload));
+    memcpy(relay_request_work_payload, ev->payload, size);
+    relay_request_work_payload_size = size;
+    k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &relay_request_work);
     return 0;
 }
 
@@ -352,17 +396,19 @@ static int raise_pmw3610_notification(cormoran_pmw3610_Notification *notificatio
     });
 }
 
-static int on_pmw3610_relay_response(const zmk_event_t *eh) {
-    const struct zmk_pmw3610_relay_response *ev = as_zmk_pmw3610_relay_response(eh);
-    if (!ev) {
-        return 0;
-    }
+static uint8_t relay_response_work_source;
+static uint8_t relay_response_work_payload[PMW3610_RELAY_RESPONSE_PAYLOAD_MAX_SIZE];
+static size_t relay_response_work_payload_size;
+
+static void relay_response_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
 
     cormoran_pmw3610_RelayResponse relay_resp = cormoran_pmw3610_RelayResponse_init_zero;
-    pb_istream_t istream = pb_istream_from_buffer(ev->payload, ev->size);
+    pb_istream_t istream =
+        pb_istream_from_buffer(relay_response_work_payload, relay_response_work_payload_size);
     if (!pb_decode(&istream, cormoran_pmw3610_RelayResponse_fields, &relay_resp)) {
         LOG_WRN("Failed to decode pmw3610 relay response: %s", PB_GET_ERROR(&istream));
-        return 0;
+        return;
     }
 
     k_mutex_lock(&peripheral_response_notification_lock, K_FOREVER);
@@ -373,11 +419,11 @@ static int on_pmw3610_relay_response(const zmk_event_t *eh) {
         cormoran_pmw3610_Notification_peripheral_response_tag;
     cormoran_pmw3610_PeripheralResponse *pr =
         &peripheral_response_notification.notification_type.peripheral_response;
-    /* ev->source was rewritten by ZMK_RELAY_EVENT_HANDLE's receive-side
+    /* Stashed source was rewritten by ZMK_RELAY_EVENT_HANDLE's receive-side
      * `source_field_name = ev->source + 1` to the relaying peripheral's
      * slot + 1 -- exactly the addressing convention this module documents
      * for `source` elsewhere (0 = local/central, N = peripheral slot N). */
-    pr->source = ev->source;
+    pr->source = relay_response_work_source;
     pr->request_id = relay_resp.request_id;
     pr->has_response = relay_resp.has_response;
     if (relay_resp.has_response) {
@@ -390,6 +436,21 @@ static int on_pmw3610_relay_response(const zmk_event_t *eh) {
     }
 
     k_mutex_unlock(&peripheral_response_notification_lock);
+}
+
+static K_WORK_DEFINE(relay_response_work, relay_response_work_handler);
+
+static int on_pmw3610_relay_response(const zmk_event_t *eh) {
+    const struct zmk_pmw3610_relay_response *ev = as_zmk_pmw3610_relay_response(eh);
+    if (!ev) {
+        return 0;
+    }
+
+    size_t size = MIN(ev->size, sizeof(relay_response_work_payload));
+    relay_response_work_source = ev->source;
+    memcpy(relay_response_work_payload, ev->payload, size);
+    relay_response_work_payload_size = size;
+    k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &relay_response_work);
     return 0;
 }
 
@@ -399,30 +460,33 @@ ZMK_SUBSCRIPTION(pmw3610_relay_response_notify, zmk_pmw3610_relay_response);
 static K_MUTEX_DEFINE(relayed_notification_lock);
 static cormoran_pmw3610_Notification relayed_notification;
 
+static uint8_t relay_notification_work_source;
+static uint8_t relay_notification_work_payload[PMW3610_RELAY_NOTIFICATION_PAYLOAD_MAX_SIZE];
+static size_t relay_notification_work_payload_size;
+
 /* A peripheral's own FrameStreamChunk notification (raised via
  * pmw3610_relay_notify(), the peripheral counterpart of this function)
  * relayed back in -- stamp `source` (the streaming peripheral's slot + 1,
  * same convention as PeripheralResponse.source) and re-raise it as the
  * actual Studio notification. */
-static int on_pmw3610_relay_notification(const zmk_event_t *eh) {
-    const struct zmk_pmw3610_relay_notification *ev = as_zmk_pmw3610_relay_notification(eh);
-    if (!ev) {
-        return 0;
-    }
+static void relay_notification_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
 
     k_mutex_lock(&relayed_notification_lock, K_FOREVER);
 
     relayed_notification = (cormoran_pmw3610_Notification)cormoran_pmw3610_Notification_init_zero;
-    pb_istream_t istream = pb_istream_from_buffer(ev->payload, ev->size);
+    pb_istream_t istream = pb_istream_from_buffer(relay_notification_work_payload,
+                                                  relay_notification_work_payload_size);
     if (!pb_decode(&istream, cormoran_pmw3610_Notification_fields, &relayed_notification)) {
         LOG_WRN("Failed to decode pmw3610 relay notification: %s", PB_GET_ERROR(&istream));
         k_mutex_unlock(&relayed_notification_lock);
-        return 0;
+        return;
     }
 
     if (relayed_notification.which_notification_type ==
         cormoran_pmw3610_Notification_frame_stream_chunk_tag) {
-        relayed_notification.notification_type.frame_stream_chunk.source = ev->source;
+        relayed_notification.notification_type.frame_stream_chunk.source =
+            relay_notification_work_source;
     }
 
     int ret = raise_pmw3610_notification(&relayed_notification);
@@ -431,6 +495,21 @@ static int on_pmw3610_relay_notification(const zmk_event_t *eh) {
     }
 
     k_mutex_unlock(&relayed_notification_lock);
+}
+
+static K_WORK_DEFINE(relay_notification_work, relay_notification_work_handler);
+
+static int on_pmw3610_relay_notification(const zmk_event_t *eh) {
+    const struct zmk_pmw3610_relay_notification *ev = as_zmk_pmw3610_relay_notification(eh);
+    if (!ev) {
+        return 0;
+    }
+
+    size_t size = MIN(ev->size, sizeof(relay_notification_work_payload));
+    relay_notification_work_source = ev->source;
+    memcpy(relay_notification_work_payload, ev->payload, size);
+    relay_notification_work_payload_size = size;
+    k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &relay_notification_work);
     return 0;
 }
 
