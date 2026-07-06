@@ -1177,10 +1177,17 @@ to three orders of magnitude — tens of fps, sensor-limited.
 
 Scope decisions (confirmed with the maintainer):
 - **4-wire burst only.** The burst path requires a real burst read (dedicated
-  MISO + CS/NCS); it is unreliable on 3-wire shared-SDIO wiring. Gate it on
-  `!config->disable_burst_read`. When `disable_burst_read` is set, keep the
-  existing per-pixel path **unchanged** (no persistent mode) — it is the
-  correctness fallback, not a performance target.
+  MISO + CS/NCS); it is unreliable on 3-wire shared-SDIO wiring. Gate the
+  *read method* on `!config->disable_burst_read`. When `disable_burst_read`
+  is set, the per-pixel PIXEL_GRAB **read algorithm is byte-for-byte
+  unchanged** — it is the correctness fallback, not a performance target.
+  The begin/read/end *session lifecycle* (G.2), however, is uniform for both
+  paths (the streaming handler is path-agnostic), so the 3-wire fallback also
+  now resets once per session rather than per frame. That is logically sound
+  (the datasheet reset is only needed to *resume navigation*, which happens
+  once at `end()`), but is unvalidated on 3-wire hardware — the validation
+  rig (G.6) is 4-wire-burst. The read algorithm being untouched bounds the
+  risk.
 - **USB transport.** Streaming is consumed over USB CDC-ACM, which is far
   faster than a BLE connection interval, so the transport is *not* the
   bottleneck after G.1/G.2. We therefore do **not** add reduced-resolution
@@ -1302,24 +1309,54 @@ overhead but are a measured G.6 follow-up, not assumed.
   fallback. Verify both still build and that `test.py` asserts the feature is
   enabled.
 
-### G.6 Hardware validation (maximize fps — the actual goal)
+### G.6 Hardware validation (maximize fps — the actual goal) — DONE
 
-On the J-Link rig (RTT logs carry `duration_ms` per frame):
-1. Flash the burst build; one-shot `CaptureFrame` → confirm 484 bytes, sane
-   image, and record the **byte format** (are top bits ever 0? → RAW8) to
-   settle G.1's caveat / G.4's enum default.
-2. Measure per-frame `duration_ms` for the burst read alone.
-3. Tune the post-arm wait (G.1 step 5) down from 10 ms toward the run-mode
-   frame period; find the smallest value that still yields a fresh, complete
-   frame.
-4. Test the **arm-once vs re-arm-per-frame** experiment (G.2): does keeping
-   FG_EN set and re-bursting return successive frames? Adopt whichever is
-   correct-and-faster.
-5. Run the stream over USB, measure sustained fps end-to-end, confirm no torn
-   frames and that navigation cleanly resumes after `SetFrameStream(false)`
-   (the single `end` reset).
-6. Regression: `disable_burst_read` build still frame-captures via the
-   untouched per-pixel path.
+Validated 2026-07-06 on the XIAO nRF52840 rig (board `0C5B206D3B120A9F`,
+J-Link `1050398082`), `pmw3610_rpc` build over USB Studio RPC. Results:
+
+1. **Byte format = RAW8.** Burst bytes never set bit7; all 484 are pixel
+   data. Settles G.1's caveat and G.4's enum: burst reports
+   `PIXEL_FORMAT_RAW8`, the web renders it as full 8-bit (no PG_VALID bit).
+2. **The nRF SPIM 255-byte EasyDMA cap (the one real bug found).** A single
+   484-byte burst transfer silently returned data only through offset 254 and
+   zero-filled 255..483 — a *fixed absolute* cutoff at 255 independent of
+   requested length (an earlier "228" reading was a dim-scene artifact),
+   despite the DT advertising `easydma-maxcnt-bits = 16`. Fix (`420a8aa`):
+   split the destination into ≤240-byte rx buffers within one CS-held
+   `spi_transceive` so the driver issues back-to-back EasyDMA transfers
+   without releasing NCS (the sensor's frame pointer only advances while NCS
+   stays low). After the fix: full 484 px, coherent 22×22 image
+   (adjacent-pixel correlation ≈ 0.74–0.79), no cutoff/garbage. This was a
+   DMA limit, *not* a 3-wire electrical limit.
+3. **Post-arm wait swept → fps ceiling.** Made the wait tunable per capture
+   (`a0c20d5`; `max_invalid_retries` reinterpreted as ms in burst mode) and
+   swept it under continuous streaming, scoring each frame's coherence
+   against a reference scene (not post-disable one-shots, which get extra
+   settle time from RPC round-trips and mislead):
+
+   | post-arm wait | streaming fps | coherent + complete? |
+   |---|---|---|
+   | 10 ms | ~53 | yes |
+   | 5 ms  | ~72 | yes (shipped default — one step of margin) |
+   | 4 ms  | ~78 | yes (measured coherent floor) |
+   | ≤3 ms | 84–102 | NO — a fraction of frames stream stale/garbled while still reporting `complete=true` |
+
+   Shipped default **5 ms (~72 fps)**; the runtime knob lets callers push to
+   4 ms or trade back toward reliability. **Net: ~0.4 fps → ~72 fps (~180×).**
+   The arm-once-vs-re-arm experiment (G.2) was left as-is (re-arm per frame,
+   matching the Arduino reference) — 72 fps already far exceeds the frame
+   viewer's needs, and re-arm is the proven-correct sequence.
+4. **Navigation recovery.** After every `SetFrameStream(false)` the stream
+   stops cleanly (0 further chunks) and `GetInfo.ready` returns true with
+   plausible `ReadDiagnostics` — the single `end()` reset restores the sensor.
+   (Direct X/Y-motion confirmation needs a human to physically move the ball;
+   not scriptable here — `ready`/diagnostics is the automated proxy.)
+5. **Not validated on hardware:** the 3-wire `disable_burst_read` per-pixel
+   fallback (the rig is 4-wire burst) — its read algorithm is byte-for-byte
+   unchanged, only the reset cadence became once-per-session (see G.0). And a
+   rig quirk, not a firmware issue: the CDC-ACM tty node flaked after reflash
+   (a second XIAO shares the `1d50:615e` VID:PID); the serial-filtered pyusb
+   transport was the reliable driver.
 
 ### G.7 Implementation order (per Dev Rules: proto → firmware → web → test)
 

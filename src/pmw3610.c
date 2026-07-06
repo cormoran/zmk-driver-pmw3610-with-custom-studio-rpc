@@ -86,13 +86,15 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 // FRAME_GRAB (0x36) enable bit ("FG_EN").
 #define PMW3610_FRAME_GRAB_ENABLE 0x80
 // Wait after arming FG_EN for one fresh frame to latch before the burst
-// read. The Arduino reference uses a fixed 10ms. This is the driver default
-// when the request does not override it (see the max_invalid_retries
-// reinterpretation in pmw3610_frame_capture_read()): the FG_EN-to-fresh-
-// frame latency is up to ~2 run-mode frame periods, so 10ms is a safe
-// starting point. Overridable per capture as the primary fps/reliability
-// knob (DESIGN.md G.6).
-#define PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MS 10
+// read. This is the driver default when the request does not override it
+// (see the max_invalid_retries reinterpretation in
+// pmw3610_frame_capture_read()). Hardware validation (DESIGN.md G.6) swept
+// this on real hardware: coherent full frames hold down to 4ms (~78 fps),
+// but 3ms and below intermittently stream stale/garbled frames (still
+// reported complete). 5ms (~72 fps streaming) keeps one step of margin
+// above that 4ms boundary against sensor/scene/temperature variation. The
+// Arduino reference uses a more conservative fixed 10ms.
+#define PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MS 5
 // Clamp range for the request-supplied post-arm wait override.
 #define PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MAX_MS 100
 

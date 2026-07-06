@@ -231,12 +231,15 @@ Frame capture uses one of two procedures depending on the sensor's wiring
 (see `disable-burst-read` above):
 
 - **4-wire burst (`FRAME_GRAB`, the default and recommended path).** One
-  burst SPI transaction reads the whole pixel array via `MOTION_BURST`
+  CS-held burst SPI transaction reads the whole pixel array via `MOTION_BURST`
   (0x12), the same primitive regular burst motion reporting uses -- see
-  `docs/pmw3610.md`'s "Frame Capture burst" section. This is fast (tens of
-  fps range; the burst transaction itself is a couple of milliseconds) and
-  is what `CaptureFrame`/`SetFrameStream` use unless the sensor node has
-  `disable-burst-read`.
+  `docs/pmw3610.md`'s "Frame Capture burst" section. This is fast: **~72 fps
+  streaming, measured on hardware** (the read itself is ~2 ms; the per-frame
+  cost is dominated by the post-arm fresh-frame wait, tunable — see
+  `max_invalid_retries` below). It is what `CaptureFrame`/`SetFrameStream` use
+  unless the sensor node has `disable-burst-read`. (The read is issued as
+  ≤240-byte sub-transfers within the single CS-held transaction to stay under
+  the nRF SPIM 255-byte EasyDMA per-transfer cap — see `docs/pmw3610.md`.)
 - **3-wire fallback (`Pixel_Grab`, `disable-burst-read` only).** The
   official PMW3610 datasheet (R2.4) `Pixel_Grab` procedure: an arm sequence
   (SPI clock request on, page-1 magic enable, SPI clock request off, test
@@ -256,12 +259,15 @@ The full pixel array is 22x22 = 484 pixels (datasheet Figure 17) either way.
   `CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE`, default 484 = 22x22) and
   returns `{frame_id, pixel_count, chunk_size, complete, duration_ms, format}`.
   `pixel_count` is clamped to the buffer size; 0 uses the driver default
-  (484). `max_invalid_retries` only applies to the 3-wire fallback (the
-  per-pixel budget of 10ms ready-bit-wait retries; 0 = driver default 3,
-  clamped to 1..100) and is ignored on the burst path. `complete` mirrors
-  the sensor's own all-pixels-read status (burst: whether the burst SPI
-  transaction itself succeeded; fallback: the datasheet's all-484 status
-  bit); `duration_ms` is the wall-clock capture duration.
+  (484). `max_invalid_retries` is dual-purpose (0 = driver default; see the
+  proto for details): on the 3-wire fallback it is the per-pixel budget of
+  10ms ready-bit-wait retries (default 3, clamped 1..100); on the burst path
+  it is reinterpreted as the **post-arm wait in ms** — the primary
+  fps/reliability knob (default 5 ms ≈ 72 fps; ~4 ms ≈ 78 fps is the
+  hardware-measured coherent floor, and ≤3 ms starts streaming stale frames).
+  `complete` mirrors the sensor's own all-pixels-read status (burst: whether
+  the burst SPI transaction itself succeeded; fallback: the datasheet's
+  all-484 status bit); `duration_ms` is the wall-clock capture duration.
 - `format` (`PixelFormat`, on both `CaptureFrameResponse` and
   `FrameStreamChunk`) discriminates the byte layout of the returned pixel
   data: `PIXEL_FORMAT_RAW8` (burst path) is a full 8-bit pixel value with no
@@ -320,8 +326,9 @@ on its own:
   `enable = false` stops the loop and ends the session (a single reset,
   resuming navigation) once the in-flight capture, if any, finishes.
   `pixel_count`/`max_invalid_retries` follow the same 0-means-default,
-  clamped semantics as `CaptureFrame` (`max_invalid_retries` only affects the
-  3-wire fallback).
+  clamped semantics as `CaptureFrame` (on the burst path `max_invalid_retries`
+  is the post-arm-wait / fps knob; on the 3-wire fallback it is the per-pixel
+  retry budget).
 - `SetFrameStream` and `CaptureFrame`/`GetFrameChunk` share the same
   firmware-side static buffer/`frame_id` counter, so only one can be active
   — enabling streaming while a one-shot capture is somehow still in
@@ -330,10 +337,9 @@ on its own:
 - Not resetting between frames (rather than a full power-up-reset +
   reconfigure after every single frame, which is what the one-shot
   `CaptureFrame` still does) is the dominant streaming speed win: on the
-  4-wire burst path this brings streaming from well under 1 fps to a burst
-  read's actual cost (a couple of milliseconds per frame, sensor-limited —
-  see "Frame capture" above; exact sustained fps depends on the sensor's own
-  frame period and is still being characterized on hardware). The 3-wire
+  4-wire burst path this brings streaming from well under 1 fps to **~72 fps
+  (measured on hardware; ~180× the old per-pixel path)**, tunable up to ~78
+  fps via `max_invalid_retries` (see "Frame capture" above). The 3-wire
   fallback's `Pixel_Grab` procedure itself is unchanged and still takes
   roughly 2 seconds per 484-pixel frame — streaming over 3-wire is a
   correctness fallback, not a performance target.
