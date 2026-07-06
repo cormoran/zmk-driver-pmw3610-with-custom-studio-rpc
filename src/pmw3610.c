@@ -155,6 +155,55 @@ static int pmw3610_read_reg(const struct device *dev, uint8_t addr, uint8_t *val
     return pmw3610_read(dev, addr, value, 1);
 }
 
+/* Max bytes per SPI sub-transfer for the burst frame read. The nRF SPIM
+ * EasyDMA truncates a single transfer at 255 bytes on this SoC even though
+ * the devicetree advertises 16-bit MAXCNT -- measured on hardware
+ * (DESIGN.md Phase G.6): a one-shot 484-byte read returns real data only
+ * through offset 254 and silently zero-fills the rest, with the cutoff at a
+ * fixed absolute offset of 255 independent of the requested length. Staying
+ * safely under 255 per sub-transfer avoids it. */
+#define PMW3610_BURST_MAX_XFER 240U
+/* 8 * 240 = 1920 px, well above the 484-pixel full frame -- an upper bound
+ * so the rx descriptor array can live on the stack. */
+#define PMW3610_BURST_MAX_SEGMENTS 8U
+
+/* Burst-read `len` pixel bytes from MOTION_BURST (0x12) in a SINGLE CS-held
+ * SPI transaction, presenting the destination as multiple
+ * <=PMW3610_BURST_MAX_XFER rx buffers so the nRF SPIM driver issues
+ * back-to-back EasyDMA transfers (each under the 255-byte cap above) with
+ * chip-select asserted the whole time. Chip-select must not toggle
+ * mid-frame: the sensor's frame-grab read pointer only advances while NCS is
+ * held low across the whole readout (matching the reference Arduino sketch's
+ * single NCS-low burst), so splitting into separate spi_transceive calls
+ * would re-read from pixel 0 each time. Caller holds data->lock. */
+static int pmw3610_burst_read_frame(const struct device *dev, uint8_t *buf, uint16_t len) {
+    const struct pixart_config *cfg = dev->config;
+    uint8_t addr = PMW3610_REG_MOTION_BURST;
+    const struct spi_buf tx_buf = {.buf = &addr, .len = sizeof(addr)};
+    const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
+
+    /* rx[0] discards the byte clocked out while `addr` is sent; the rest
+     * receive the frame in <=PMW3610_BURST_MAX_XFER segments. */
+    struct spi_buf rx_buf[1 + PMW3610_BURST_MAX_SEGMENTS];
+    size_t n = 0;
+    rx_buf[n++] = (struct spi_buf){.buf = NULL, .len = sizeof(addr)};
+
+    uint16_t off = 0;
+    while (off < len && n < ARRAY_SIZE(rx_buf)) {
+        uint16_t seg = MIN((uint16_t)PMW3610_BURST_MAX_XFER, (uint16_t)(len - off));
+        rx_buf[n++] = (struct spi_buf){.buf = &buf[off], .len = seg};
+        off += seg;
+    }
+    if (off < len) {
+        LOG_ERR("Frame capture (burst): %u px exceeds %u-segment budget", len,
+                PMW3610_BURST_MAX_SEGMENTS);
+        return -EINVAL;
+    }
+
+    const struct spi_buf_set rx = {.buffers = rx_buf, .count = n};
+    return spi_transceive_dt(&cfg->spi, &tx, &rx);
+}
+
 static int pmw3610_write_reg(const struct device *dev, uint8_t addr, uint8_t value) {
     const struct pixart_config *cfg = dev->config;
     uint8_t write_buf[] = {addr | SPI_WRITE_BIT, value};
@@ -1561,7 +1610,7 @@ int pmw3610_frame_capture_read(const struct device *dev,
         result->format = PMW3610_PIXEL_FORMAT_RAW8;
         err = pmw3610_frame_capture_arm_burst(dev);
         if (!err) {
-            err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, pixel_count);
+            err = pmw3610_burst_read_frame(dev, buf, pixel_count);
             if (!err) {
                 /* The burst transaction is all-or-nothing -- unlike
                  * PIXEL_GRAB there is no partial/early-abort concept, so
