@@ -1145,3 +1145,226 @@ reference implementation to copy):
    (the web-side "streaming" is a sequential capture loop with no fixed
    interval, so FPS is bounded entirely by hardware/RPC speed, not
    simulated in any test so far).
+
+## Phase G: fast burst frame capture (maximize frame rate)
+
+### G.0 Problem — two multiplicative bottlenecks
+
+The Phase D/E frame path is ~0.4–0.5 fps. Two independent causes stack:
+
+1. **Per-pixel `PIXEL_GRAB` read.** `pmw3610_capture_frame()` reads all 484
+   pixels one register at a time (steps 9–11 of the datasheet Pixel_Grab
+   loop), and each pixel blocks until `OBSERVATION1` (0x2D) bit2 reasserts —
+   once per sensor frame (~4 ms in forced run mode). ~484 × ~4 ms ≈ **~2 s
+   per frame**, purely on the sensor side.
+2. **Full sensor reset between every frame.** `pmw3610_capture_frame()`
+   unconditionally runs `pmw3610_capture_frame_recover_locked()` on exit — a
+   power-up reset + the whole staged async re-init (`async_init_delay[]`
+   sleeps). For a one-shot capture that is correct (navigation must resume).
+   But the streaming loop calls `pmw3610_capture_frame()` per frame, so it
+   pays a **complete sensor re-init on every streamed frame**, on top of the
+   ~2 s. This dominates streaming.
+
+The repo already documents the fast alternative it never wired up:
+`docs/pmw3610.md` "Frame Capture burst" (method 1) and the reference Arduino
+sketch (`trackball-frame-visualizer/.../xiao_nRF52840_pmw3610_burst.ino`),
+which pulls a full 484-byte frame in **one** burst SPI transaction and never
+resets between frames.
+
+Two fixes, multiplicative: **G.1** replaces per-pixel read with a burst read;
+**G.2** removes the per-frame reset via a persistent capture mode. Target: two
+to three orders of magnitude — tens of fps, sensor-limited.
+
+Scope decisions (confirmed with the maintainer):
+- **4-wire burst only.** The burst path requires a real burst read (dedicated
+  MISO + CS/NCS); it is unreliable on 3-wire shared-SDIO wiring. Gate the
+  *read method* on `!config->disable_burst_read`. When `disable_burst_read`
+  is set, the per-pixel PIXEL_GRAB **read algorithm is byte-for-byte
+  unchanged** — it is the correctness fallback, not a performance target.
+  The begin/read/end *session lifecycle* (G.2), however, is uniform for both
+  paths (the streaming handler is path-agnostic), so the 3-wire fallback also
+  now resets once per session rather than per frame. That is logically sound
+  (the datasheet reset is only needed to *resume navigation*, which happens
+  once at `end()`), but is unvalidated on 3-wire hardware — the validation
+  rig (G.6) is 4-wire-burst. The read algorithm being untouched bounds the
+  risk.
+- **USB transport.** Streaming is consumed over USB CDC-ACM, which is far
+  faster than a BLE connection interval, so the transport is *not* the
+  bottleneck after G.1/G.2. We therefore do **not** add reduced-resolution
+  streaming or grow `CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE` in this phase; the
+  notify loop only needs a correctness fix (G.3). Revisit if BLE streaming
+  becomes a goal.
+
+### G.1 Burst frame capture (FRAME_GRAB, register 0x36)
+
+When `!config->disable_burst_read`, capture one frame as:
+
+Arm (raw `pmw3610_write_reg()`, matching the existing arm sequence's reason —
+the sequence manages the 0x41 clock request itself):
+1. `0x11 = 0xF1` — PERFORMANCE: force run / disable rest (same intent as the
+   current force-run write; see note below on doing this once in G.2).
+2. `0x41 = 0xBA` — SPI clock on request, then wait `T_CLOCK_ON_DELAY_US`.
+3. `0x32 = 0x10` — test clock on. **Note the value: `0x10`, the burst
+   variant** (the per-pixel path uses `0x90`). Use `0x10` for FRAME_GRAB.
+4. `0x36 = 0x80` — FG_EN (frame-grab enable).
+5. Wait for one fresh frame to latch. The Arduino uses a fixed `delay(10)`
+   (10 ms). Start there; G.6 tunes it down toward the run-mode frame period
+   (~4 ms) on hardware.
+
+Read: a single burst transaction of `pixel_count` (default 484) bytes from
+`PMW3610_REG_MOTION_BURST` (0x12) — reuse the existing `pmw3610_read(dev,
+0x12, buf, len)` primitive, which already issues one CS-held
+`spi_transceive_dt` (tx = address byte, rx = discard byte + `len` data
+bytes). This is exactly the motion-burst primitive, just with `len = 484`.
+At the DT `spi-max-frequency = 2 MHz`, 485 bytes ≈ ~2 ms.
+
+**Byte-format caveat (verify on hardware, G.6).** The per-pixel `PIXEL_GRAB`
+byte is `bit7 = PG_VALID`, `bits[6:0] = pixel`. The FRAME_GRAB burst almost
+certainly returns a **full 8-bit pixel with no per-pixel valid bit**. The web
+renderer currently treats bit7 as validity (`isValidPixelByte`) and scales
+`bits[6:0] << 1`. If burst bytes are full 8-bit, that path misrenders. So the
+frame response/notification must carry a **format discriminator** (G.4) and
+the web must branch on it. Confirm the actual byte layout with a real capture
+before finalizing the web side.
+
+### G.2 Persistent capture mode (no per-frame reset)
+
+Split the monolithic `pmw3610_capture_frame()` into a three-call lifecycle in
+the driver (public API in `pmw3610_api.h`), so a stream enters once and
+resets once:
+
+- `pmw3610_frame_capture_begin(dev, params)` — take `data->lock`, require
+  `data->ready` (else `-EBUSY`), set `data->capture_active = true`, release
+  lock, IRQ off. **Once per session:** force run mode and confirm it landed
+  (the existing PERFORMANCE `|= 0xF0` write + clear-and-poll OBSERVATION1 for
+  MODE==Run), then enable the test clock. Set a new
+  `data->capture_mode_active` flag. (The per-pixel fallback keeps arming
+  inside `_read`; only the burst path benefits from arming here — keep the
+  begin/read split identical for both so the streaming handler is uniform.)
+- `pmw3610_frame_capture_read(dev, buf, len, result)` — capture **one** frame,
+  no reset. Burst path: (re-)arm FG_EN + wait + burst-read (G.1). Per-pixel
+  path: the existing steps 1–11 loop. Take `data->lock` for the duration of
+  the read so a concurrent ReadRegister/WriteRegister RPC can't interleave
+  SPI transactions. Fills `result` (pixel_count, complete, duration_ms,
+  format).
+- `pmw3610_frame_capture_end(dev)` — take lock, run the existing
+  `pmw3610_capture_frame_recover_locked()` (power-up reset + async re-init +
+  `sw_smart_flag` reset), clear `capture_active`/`capture_mode_active`,
+  release. IRQ re-enables when async init reaches its last step, as today.
+
+Rewire the two callers:
+- One-shot `CaptureFrame` = `begin` → `read` → `end` (externally unchanged:
+  still resets after a single frame).
+- `SetFrameStream(enable=true)` = `begin` once, then the work handler calls
+  `read` per iteration (**no reset between frames** — this is the dominant
+  streaming win). `SetFrameStream(enable=false)`, Studio lock, and split
+  disconnect all call `end`. `begin` failure (e.g. `-EBUSY`) must surface as
+  an error response and leave streaming off.
+
+**Open experiment for max fps (G.6):** whether FG_EN must be re-armed each
+frame (Arduino re-arms every call) or can be armed once with repeated burst
+reads returning successive frames. If arm-once works, `_read` drops to just
+the burst transaction (~2 ms) + frame-period wait — potentially 100+ fps.
+Design `_read` so the per-frame arm is a single helper that can be hoisted
+into `begin` behind a flag once hardware confirms which behavior is correct.
+
+### G.3 Notify loop (correctness fix, USB)
+
+`frame_stream_work_handler()` currently `break`s out of the chunk loop on any
+`notify_*` error, silently dropping the rest of a frame. Over USB the TX ring
+rarely stalls, but the loop should still **retry with a short `k_yield()` /
+`k_sleep(K_MSEC(1))` on a transient enqueue failure** (e.g. `-ENOMEM`) rather
+than abandon the frame mid-way, so a momentarily-full TX buffer produces
+back-pressure, not a torn frame. Keep back-to-back rescheduling with
+`K_NO_WAIT`; capture (~15 ms) now paces the loop, and capture(N+1) overlaps
+the async USB drain of frame N (notifications enqueue and return; the CDC
+stack drains them), which is the frame-level pipelining the request asked for.
+No intra-frame SPI↔USB splitting — the ~2 ms burst read is far shorter than
+any useful pipelining granularity.
+
+`PMW3610_FRAME_CHUNK_SIZE` stays 128 for now (fits the existing TX buffer with
+its BUILD_ASSERT headroom). Larger chunks reduce per-notification framing
+overhead but are a measured G.6 follow-up, not assumed.
+
+### G.4 Proto / web
+
+- Add a format discriminator to `CaptureFrameResponse` and `FrameStreamChunk`,
+  e.g. `enum PixelFormat { PIXEL_FORMAT_PG7 = 0; PIXEL_FORMAT_RAW8 = 1; }`
+  (PG7 = current bit7-valid + 7-bit value; RAW8 = burst full 8-bit). Default 0
+  keeps the per-pixel path wire-compatible. Regenerate nanopb + TS bindings.
+- `web/src/frame.ts`: make `isValidPixelByte`/`pixelByteToGray` format-aware
+  (RAW8: every byte valid, gray = byte). `FrameViewer.tsx` reads the format
+  off the response/chunk. Update `test/frame.spec.ts` for the RAW8 path.
+- README: update fps expectation (was "~0.4–0.5 fps hardware limitation");
+  note burst path requires 4-wire (non-`disable-burst-read`) wiring.
+
+### G.5 Tests
+
+- Unit (`web`): RAW8 rendering path in `frame.spec.ts`.
+- Unit (firmware, `tests/`): the begin/read/end state transitions and the
+  `disable_burst_read` → path selection where reachable in `native_sim`
+  (mock SPI as existing sensor tests do).
+- Build test (`tests/zmk-config`): the burst overlay `pmw3610-trackball`
+  already exercises the 4-wire path; the `-no-burst` overlay covers the
+  fallback. Verify both still build and that `test.py` asserts the feature is
+  enabled.
+
+### G.6 Hardware validation (maximize fps — the actual goal) — DONE
+
+Validated 2026-07-06 on the XIAO nRF52840 rig (board `0C5B206D3B120A9F`,
+J-Link `1050398082`), `pmw3610_rpc` build over USB Studio RPC. Results:
+
+1. **Byte format = RAW8.** Burst bytes never set bit7; all 484 are pixel
+   data. Settles G.1's caveat and G.4's enum: burst reports
+   `PIXEL_FORMAT_RAW8`, the web renders it as full 8-bit (no PG_VALID bit).
+2. **The nRF SPIM 255-byte EasyDMA cap (the one real bug found).** A single
+   484-byte burst transfer silently returned data only through offset 254 and
+   zero-filled 255..483 — a *fixed absolute* cutoff at 255 independent of
+   requested length (an earlier "228" reading was a dim-scene artifact),
+   despite the DT advertising `easydma-maxcnt-bits = 16`. Fix (`420a8aa`):
+   split the destination into ≤240-byte rx buffers within one CS-held
+   `spi_transceive` so the driver issues back-to-back EasyDMA transfers
+   without releasing NCS (the sensor's frame pointer only advances while NCS
+   stays low). After the fix: full 484 px, coherent 22×22 image
+   (adjacent-pixel correlation ≈ 0.74–0.79), no cutoff/garbage. This was a
+   DMA limit, *not* a 3-wire electrical limit.
+3. **Post-arm wait swept → fps ceiling.** Made the wait tunable per capture
+   (`a0c20d5`; `max_invalid_retries` reinterpreted as ms in burst mode) and
+   swept it under continuous streaming, scoring each frame's coherence
+   against a reference scene (not post-disable one-shots, which get extra
+   settle time from RPC round-trips and mislead):
+
+   | post-arm wait | streaming fps | coherent + complete? |
+   |---|---|---|
+   | 10 ms | ~53 | yes |
+   | 5 ms  | ~72 | yes (shipped default — one step of margin) |
+   | 4 ms  | ~78 | yes (measured coherent floor) |
+   | ≤3 ms | 84–102 | NO — a fraction of frames stream stale/garbled while still reporting `complete=true` |
+
+   Shipped default **5 ms (~72 fps)**; the runtime knob lets callers push to
+   4 ms or trade back toward reliability. **Net: ~0.4 fps → ~72 fps (~180×).**
+   The arm-once-vs-re-arm experiment (G.2) was left as-is (re-arm per frame,
+   matching the Arduino reference) — 72 fps already far exceeds the frame
+   viewer's needs, and re-arm is the proven-correct sequence.
+4. **Navigation recovery.** After every `SetFrameStream(false)` the stream
+   stops cleanly (0 further chunks) and `GetInfo.ready` returns true with
+   plausible `ReadDiagnostics` — the single `end()` reset restores the sensor.
+   (Direct X/Y-motion confirmation needs a human to physically move the ball;
+   not scriptable here — `ready`/diagnostics is the automated proxy.)
+5. **Not validated on hardware:** the 3-wire `disable_burst_read` per-pixel
+   fallback (the rig is 4-wire burst) — its read algorithm is byte-for-byte
+   unchanged, only the reset cadence became once-per-session (see G.0). And a
+   rig quirk, not a firmware issue: the CDC-ACM tty node flaked after reflash
+   (a second XIAO shares the `1d50:615e` VID:PID); the serial-filtered pyusb
+   transport was the reliable driver.
+
+### G.7 Implementation order (per Dev Rules: proto → firmware → web → test)
+
+- **G-a** proto: add `PixelFormat` + fields, regen nanopb/TS.
+- **G-b** driver: `begin`/`read`/`end` split + burst path (`!disable_burst_read`)
+  + one-shot rewire; per-pixel path preserved as fallback.
+- **G-c** request_exec: stream handler → begin/read/end + notify back-pressure.
+- **G-d** web: format-aware rendering + README fps update.
+- **G-e** unit + build tests.
+- **G-f** hardware validation + fps tuning (G.6); fold results back into
+  `docs/pmw3610.md` and this section.

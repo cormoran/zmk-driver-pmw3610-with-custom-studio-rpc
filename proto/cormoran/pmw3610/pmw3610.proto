@@ -21,6 +21,22 @@ package cormoran.pmw3610;
 // supports this sentinel.
 message GetInfoRequest { uint32 source = 1; }
 
+// Discriminates the byte format of raw pixel data returned by
+// CaptureFrame/GetFrameChunk/FrameStreamChunk. Default (0) is PG7, the
+// original per-pixel Pixel_Grab byte format, so old clients/firmware that
+// never set this field stay wire-compatible.
+enum PixelFormat {
+    // Per-pixel Pixel_Grab byte: bit7 = PG_VALID, bits[6:0] = pixel value
+    // (see CaptureFrameRequest doc). Produced by the 3-wire fallback path
+    // (disable-burst-read) and by any firmware built before this field
+    // existed (default value).
+    PIXEL_FORMAT_PG7 = 0;
+    // Full 8-bit pixel value with no per-pixel validity bit, as returned by
+    // the FRAME_GRAB burst read (register 0x36/0x12; see docs/pmw3610.md
+    // "Frame Capture burst"). Produced by the 4-wire burst path.
+    PIXEL_FORMAT_RAW8 = 1;
+}
+
 message RuntimeConfig {
     uint32 cpi = 1;
     bool swap_xy = 2;
@@ -120,9 +136,18 @@ message CaptureFrameRequest {
     // the firmware's static frame buffer size
     // (CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE).
     uint32 pixel_count = 2;
-    // Max 10ms-wait retries per pixel while waiting for OBSERVATION1 bit2
-    // (pixel-ready) before the capture aborts, returning whatever was
-    // collected so far. 0 means the driver default (3); clamped to 1..100.
+    // Dual-purpose, depending on the sensor's read path (see
+    // CaptureFrameResponse.format):
+    //   PG7 (3-wire per-pixel PIXEL_GRAB): max 10ms-wait retries per pixel
+    //   while waiting for OBSERVATION1 bit2 (pixel-ready) before the capture
+    //   aborts, returning whatever was collected so far. Default 3.
+    //   RAW8 (4-wire burst FRAME_GRAB): reinterpreted as the post-arm wait in
+    //   milliseconds -- how long to wait after FG_EN for a fresh frame to
+    //   latch before the burst read. This is the primary fps/reliability knob
+    //   for streaming: smaller = higher fps, but below ~4ms frames may stream
+    //   stale/garbled (still reported complete). Default 5ms (~72fps); the
+    //   hardware-measured coherent floor is ~4ms (~78fps). See DESIGN.md G.6.
+    // 0 = the driver default for whichever path applies; clamped to 1..100.
     uint32 max_invalid_retries = 3;
     // Former procedure-tuning knobs (write_frame_grab, frame_grab_value,
     // skip_pixel_grab_reset) were removed when the official datasheet
@@ -147,6 +172,9 @@ message CaptureFrameResponse {
     // Wall-clock duration of the capture procedure (arm sequence through
     // the completion check), in milliseconds.
     uint32 duration_ms = 5;
+    // Byte format of `data`/GetFrameChunk's bytes for this frame. Default
+    // (0 = PIXEL_FORMAT_PG7) keeps old clients working unmodified.
+    PixelFormat format = 6;
 }
 
 // Fetch a chunk of a previously captured frame's pixel bytes.
@@ -176,8 +204,12 @@ message GetFrameChunkResponse {
 message SetFrameStreamRequest {
     uint32 device_index = 1;
     bool enable = 2;
-    uint32 pixel_count = 3;         // 0 = driver default, same as CaptureFrameRequest.
-    uint32 max_invalid_retries = 4; // 0 = driver default, same as CaptureFrameRequest.
+    uint32 pixel_count = 3; // 0 = driver default, same as CaptureFrameRequest.
+    // 0 = driver default, same dual-purpose meaning as
+    // CaptureFrameRequest.max_invalid_retries: per-pixel wait retries on the
+    // 3-wire PG7 path, or the post-arm wait in ms (the streaming fps knob) on
+    // the 4-wire RAW8 burst path (default 5ms/~72fps; ~4ms/~78fps floor).
+    uint32 max_invalid_retries = 4;
     // See GetInfoRequest.source.
     uint32 source = 5;
 }
@@ -273,6 +305,8 @@ message FrameStreamChunk {
     // from a peripheral (see DESIGN.md Phase F); always 0 for a locally
     // streamed frame.
     uint32 source = 6;
+    // Byte format of `data` for this frame (see CaptureFrameResponse.format).
+    PixelFormat format = 7;
 }
 
 message Notification {

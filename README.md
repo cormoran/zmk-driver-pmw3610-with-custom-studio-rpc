@@ -127,6 +127,11 @@ For more info on modules, you can read through through the [Zephyr modules page]
    recommended) and `pmw3610-trackball-no-burst` (OFF) under
    `tests/zmk-config/snippets/`.
 
+   The burst-read wiring is also what unlocks the fast `FRAME_GRAB` frame
+   capture path (see "Frame capture" below) -- `disable-burst-read` falls
+   back to the much slower per-pixel `Pixel_Grab` capture for both regular
+   motion reporting and frame capture.
+
    ```conf
    CONFIG_PMW3610=y
    CONFIG_INPUT=y
@@ -222,41 +227,77 @@ Notes:
 
 ### Frame capture (`CaptureFrame` / `GetFrameChunk`)
 
-Frame capture follows the official PMW3610 datasheet (R2.4) `Pixel_Grab`
-procedure: an arm sequence (SPI clock request on, page-1 magic enable,
-SPI clock request off, test clock on, `PIXEL_GRAB` (0x35) = 0x01), then per
-pixel: wait for `OBSERVATION1` (0x2D) bit2, read `PIXEL_GRAB`, write
-`OBSERVATION1` = 0x01 to advance. `PRBS_TEST_CTL` (0x47) bit0 afterwards
-reports whether the sensor considers all 484 pixels read. The full pixel
-array is 22x22 = 484 pixels (datasheet Figure 17).
+Frame capture uses one of two procedures depending on the sensor's wiring
+(see `disable-burst-read` above):
+
+- **4-wire burst (`FRAME_GRAB`, the default and recommended path).** One
+  CS-held burst SPI transaction reads the whole pixel array via `MOTION_BURST`
+  (0x12), the same primitive regular burst motion reporting uses -- see
+  `docs/pmw3610.md`'s "Frame Capture burst" section. This is fast: **~72 fps
+  streaming, measured on hardware** (the read itself is ~2 ms; the per-frame
+  cost is dominated by the post-arm fresh-frame wait, tunable — see
+  `max_invalid_retries` below). It is what `CaptureFrame`/`SetFrameStream` use
+  unless the sensor node has `disable-burst-read`. (The read is issued as
+  ≤240-byte sub-transfers within the single CS-held transaction to stay under
+  the nRF SPIM 255-byte EasyDMA per-transfer cap — see `docs/pmw3610.md`.)
+- **3-wire fallback (`Pixel_Grab`, `disable-burst-read` only).** The
+  official PMW3610 datasheet (R2.4) `Pixel_Grab` procedure: an arm sequence
+  (SPI clock request on, page-1 magic enable, SPI clock request off, test
+  clock on, `PIXEL_GRAB` (0x35) = 0x01), then per pixel: wait for
+  `OBSERVATION1` (0x2D) bit2, read `PIXEL_GRAB`, write `OBSERVATION1` = 0x01
+  to advance. `PRBS_TEST_CTL` (0x47) bit0 afterwards reports whether the
+  sensor considers all 484 pixels read. This is slow (~2 seconds for a full
+  484-pixel frame, measured on real hardware) since each pixel blocks on a
+  sensor-side handshake -- it exists purely as a correctness fallback for
+  wiring that can't hold chip-select across a burst transfer, not as a
+  performance target.
+
+The full pixel array is 22x22 = 484 pixels (datasheet Figure 17) either way.
 
 - `CaptureFrame{device_index, pixel_count, max_invalid_retries}` → captures
   into a firmware-side static buffer (size
   `CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE`, default 484 = 22x22) and
-  returns `{frame_id, pixel_count, chunk_size, complete, duration_ms}`.
+  returns `{frame_id, pixel_count, chunk_size, complete, duration_ms, format}`.
   `pixel_count` is clamped to the buffer size; 0 uses the driver default
-  (484). `max_invalid_retries` is the per-pixel budget of 10ms
-  ready-bit-wait retries (0 = driver default 3, clamped to 1..100).
-  `complete` mirrors the sensor's own all-484-pixels-read status bit;
-  `duration_ms` is the wall-clock capture duration.
+  (484). `max_invalid_retries` is dual-purpose (0 = driver default; see the
+  proto for details): on the 3-wire fallback it is the per-pixel budget of
+  10ms ready-bit-wait retries (default 3, clamped 1..100); on the burst path
+  it is reinterpreted as the **post-arm wait in ms** — the primary
+  fps/reliability knob (default 5 ms ≈ 72 fps; ~4 ms ≈ 78 fps is the
+  hardware-measured coherent floor, and ≤3 ms starts streaming stale frames).
+  `complete` mirrors the sensor's own all-pixels-read status (burst: whether
+  the burst SPI transaction itself succeeded; fallback: the datasheet's
+  all-484 status bit); `duration_ms` is the wall-clock capture duration.
+- `format` (`PixelFormat`, on both `CaptureFrameResponse` and
+  `FrameStreamChunk`) discriminates the byte layout of the returned pixel
+  data: `PIXEL_FORMAT_RAW8` (burst path) is a full 8-bit pixel value with no
+  per-pixel validity bit; `PIXEL_FORMAT_PG7` (3-wire fallback, and the
+  default/0 value for older firmware that predates this field) is the
+  `Pixel_Grab` byte described below. The web UI's `frame.ts` helpers
+  (`isValidPixelByte`/`pixelByteToGray`/`frameToRgba`) all take this as a
+  parameter and default to `PIXEL_FORMAT_PG7` when absent.
 - `GetFrameChunk{frame_id, offset}` → `{frame_id, offset, bytes data}`, up to
   128 bytes per call. Call it repeatedly with increasing offsets (0, 128,
   256, ...) until `offset + data.size >= pixel_count` to assemble the full
   frame; `frame_id` must match the most recent `CaptureFrame` response or the
   call fails.
-- Each raw byte's bit7 is `PG_Valid` (bits[6:0] are the pixel value); the
-  firmware stores the byte as-is (does not mask it) so the host can inspect
-  capture quality. The web UI masks bit7 for display and separately counts
-  invalid bytes as a warning.
+- On the 3-wire fallback (`PIXEL_FORMAT_PG7`), each raw byte's bit7 is
+  `PG_Valid` (bits[6:0] are the pixel value); the firmware stores the byte
+  as-is (does not mask it) so the host can inspect capture quality. On the
+  burst path (`PIXEL_FORMAT_RAW8`), every byte is a full 8-bit pixel with no
+  validity bit. The web UI masks bit7 for display only in the PG7 case, and
+  separately counts invalid bytes as a warning (always 0 for RAW8).
 - During capture: the motion IRQ is disabled and an internal flag makes the
   normal motion-report path a no-op, so capturing a frame does not interleave
   with mouse movement reporting. The datasheet requires a reset to resume
-  navigation after a pixel grab, so on return (success **or** failure) the
-  driver always re-runs the power-up-reset + reconfigure flow (same as
-  `pmw3610_resume()`'s not-ready path) before returning, and the whole
+  navigation after a frame grab, so a one-shot `CaptureFrame` always re-runs
+  the power-up-reset + reconfigure flow (same as `pmw3610_resume()`'s
+  not-ready path) on return (success **or** failure), and the whole
   procedure is bounded to ~5 seconds of wall-clock time regardless of
   `pixel_count`/`max_invalid_retries`, so a misbehaving sensor cannot hang
   the Studio RPC thread. (A typical complete capture is far faster.)
+  `SetFrameStream` instead resets only once per streaming session -- see
+  below.
 - A 128-byte `GetFrameChunk` data chunk plus proto framing overhead must fit
   in one `CONFIG_ZMK_STUDIO_RPC_TX_BUF_SIZE` (256 in this module's test
   config) — a `BUILD_ASSERT` in `src/studio/pmw3610_handler.c` catches a
@@ -271,28 +312,41 @@ Instead of a client-driven poll loop, the firmware can push captured frames
 on its own:
 
 - `SetFrameStream{device_index, enable, pixel_count, max_invalid_retries}` →
-  `{streaming}`. `enable = true` starts a background loop (system
-  workqueue) that repeatedly calls the same capture procedure as
-  `CaptureFrame` and, on each successful capture, raises one
-  `FrameStreamChunk` **notification** (not a response) per 128-byte chunk —
-  `{frame_id, offset, bytes data, total_size, complete}`, where `total_size`
-  and `complete` are repeated on every chunk of a frame so the client can
-  detect the last chunk without a separate "done" message. `enable = false`
-  stops the loop (the in-flight capture, if any, still finishes first).
+  `{streaming}`. `enable = true` begins a persistent capture session **once**
+  (forcing run mode and confirming it landed -- this one-time setup can take
+  up to ~700ms from a deep rest mode; a failure here is returned as an
+  `ErrorResponse` and streaming stays off) and starts a background loop (a
+  dedicated low-priority workqueue, so it never blocks unrelated system
+  workqueue consumers) that captures one frame per iteration **with no reset
+  in between** and, on each successful capture, raises one `FrameStreamChunk`
+  **notification** (not a response) per 128-byte chunk —
+  `{frame_id, offset, bytes data, total_size, complete, format}`, where
+  `total_size`/`complete`/`format` are repeated on every chunk of a frame so
+  the client can detect the last chunk without a separate "done" message.
+  `enable = false` stops the loop and ends the session (a single reset,
+  resuming navigation) once the in-flight capture, if any, finishes.
   `pixel_count`/`max_invalid_retries` follow the same 0-means-default,
-  clamped semantics as `CaptureFrame`.
+  clamped semantics as `CaptureFrame` (on the burst path `max_invalid_retries`
+  is the post-arm-wait / fps knob; on the 3-wire fallback it is the per-pixel
+  retry budget).
 - `SetFrameStream` and `CaptureFrame`/`GetFrameChunk` share the same
   firmware-side static buffer/`frame_id` counter, so only one can be active
   — enabling streaming while a one-shot capture is somehow still in
   progress is not possible (`CaptureFrame` is synchronous), and
   `CaptureFrame` rejects while streaming is on (see above).
-- Because a 484-pixel `Pixel_Grab` capture takes roughly 2 seconds on real
-  hardware (measured in Phase D), the loop's "as fast as possible" pacing
-  naturally lands around 0.4-0.5 fps — this is a hardware limitation of the
-  sensor's Pixel_Grab procedure, not a bug or artificial throttle.
+- Not resetting between frames (rather than a full power-up-reset +
+  reconfigure after every single frame, which is what the one-shot
+  `CaptureFrame` still does) is the dominant streaming speed win: on the
+  4-wire burst path this brings streaming from well under 1 fps to **~72 fps
+  (measured on hardware; ~180× the old per-pixel path)**, tunable up to ~78
+  fps via `max_invalid_retries` (see "Frame capture" above). The 3-wire
+  fallback's `Pixel_Grab` procedure itself is unchanged and still takes
+  roughly 2 seconds per 484-pixel frame — streaming over 3-wire is a
+  correctness fallback, not a performance target.
 - If Studio locks while a stream is running, the firmware stops it after
   the current in-flight capture (a listener on the core lock-state event
-  sets the internal "streaming active" flag to false) — see "Security"
+  sets the internal "streaming active" flag to false, which also ends the
+  capture session/resets the sensor on the same workqueue) — see "Security"
   above. Notifications themselves are not lock-gated at the transport
   level, only the `SetFrameStream` call that starts/stops a stream is.
 - The web UI's frame viewer uses this instead of a client poll loop — see
@@ -306,7 +360,9 @@ for the exact field numbers:
 // CaptureFrame request (defaults: full 22x22 frame)
 { "captureFrame": { "deviceIndex": 0, "pixelCount": 484 } }
 // -> { "captureFrame": { "frameId": 1, "pixelCount": 484, "chunkSize": 128,
-//      "complete": true, "durationMs": 480 } }
+//      "complete": true, "durationMs": 12, "format": "PIXEL_FORMAT_RAW8" } }
+//    ("format" is PIXEL_FORMAT_PG7 -- the default/0 value -- on a
+//    disable-burst-read sensor, or when talking to older firmware.)
 
 // GetFrameChunk request (repeat with offset 0, 128, 256, 384)
 { "getFrameChunk": { "frameId": 1, "offset": 0 } }
@@ -317,7 +373,7 @@ for the exact field numbers:
 // -> { "setFrameStream": { "streaming": true } }
 // ... followed by repeated notifications, e.g.:
 // { "frameStreamChunk": { "frameId": 1, "offset": 0, "data": "<128 bytes base64>",
-//     "totalSize": 484, "complete": true } }
+//     "totalSize": 484, "complete": true, "format": "PIXEL_FORMAT_RAW8" } }
 
 // SetFrameStream request (stop)
 { "setFrameStream": { "deviceIndex": 0, "enable": false } }

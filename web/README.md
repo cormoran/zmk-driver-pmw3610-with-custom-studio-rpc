@@ -188,18 +188,33 @@ device_index, pixel_count, max_invalid_retries}`, then the firmware
   unsubscribes. `CaptureFrame` and `SetFrameStream` share the same
   firmware-side buffer/frame_id, so the UI disables "Capture Once" while
   streaming is on.
-- Frame rate while streaming is bounded by the sensor itself: a 484-pixel
-  `Pixel_Grab` capture takes roughly 2 seconds (measured on real hardware in
-  Phase D), so expect on the order of 0.4-0.5 fps, not a bug -- the FPS
-  counter reflects this.
+- Frame rate depends on the sensor's wiring (`disable-burst-read`, see the
+  module README's "Wiring" section): the default 4-wire burst path resets
+  the sensor only once per streaming session and reads a whole frame in one
+  SPI transaction, so it is sensor-limited rather than reset-limited -- much
+  faster than earlier per-pixel-only builds. The 3-wire fallback still
+  captures one 484-pixel frame via the `Pixel_Grab` procedure in roughly 2
+  seconds (measured on real hardware), so expect on the order of 0.4-0.5 fps
+  there -- not a bug, a correctness fallback for wiring that can't do a real
+  burst read, not a performance target. The FPS counter reflects whichever
+  path is actually wired up.
 - If ZMK Studio locks while a stream is active, the firmware stops the loop
   on its own (see the module README's "Security" section) but cannot notify
   the client that it did so (notifications aren't request/response) -- the
   web app detects this via the lock-state banner/notification and resets
   its own "streaming" UI state to match once locked.
-- Each raw pixel byte's bit7 is PG_VALID; the viewer masks it off for
-  display (`(byte & 0x7f) << 1` for 8-bit grayscale) but also counts and
-  shows bytes with bit7 clear as a data-quality warning.
+- Each `CaptureFrameResponse`/`FrameStreamChunk` carries a `format` field
+  (`PixelFormat`) discriminating the pixel byte layout: `PIXEL_FORMAT_RAW8`
+  (4-wire burst path) is a full 8-bit pixel with no validity bit;
+  `PIXEL_FORMAT_PG7` (3-wire fallback, and the default for older firmware
+  that predates this field) has bit7 as `PG_VALID` with bits[6:0] the pixel
+  value. `src/frame.ts`'s `isValidPixelByte`/`pixelByteToGray`/`frameToRgba`
+  all take `format` as an (optional, defaulting to PG7) parameter and
+  `FrameViewer.tsx` threads the response/notification's `format` through to
+  them -- PG7 masks bit7 for display (`(byte & 0x7f) << 1` for 8-bit
+  grayscale) and counts bit7-clear bytes as a data-quality warning; RAW8
+  renders every byte as-is and always reports 0 invalid bytes (the burst
+  read is all-or-nothing -- see `complete`).
 
 ## Roadmap
 

@@ -14,6 +14,8 @@ import {
   chunkOffsets,
   createFrameAssembler,
   frameToRgba,
+  isValidPixelByte,
+  PixelFormat,
   type FrameChunk,
 } from "./frame";
 import { isUnlockRequiredError } from "./useStudioLockState";
@@ -131,15 +133,22 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
       chunks.push({ offset: chunk.offset, data: chunk.data });
     }
 
-    const assembled = assembleFrame(chunks, totalLength);
-    renderFrame(assembled.bytes, side);
+    // Old firmware never sets `format`, which decodes to the enum's zero
+    // value -- PIXEL_FORMAT_PG7, already the desired default.
+    const format = captureFrame.format ?? PixelFormat.PIXEL_FORMAT_PG7;
+    const assembled = assembleFrame(chunks, totalLength, format);
+    renderFrame(assembled.bytes, side, format);
     setInvalidCount(assembled.invalidCount);
     setPixelCount(totalLength);
     setComplete(captureFrame.complete);
     setDurationMs(captureFrame.durationMs);
   };
 
-  const renderFrame = (bytes: Uint8Array, sideLength: number) => {
+  const renderFrame = (
+    bytes: Uint8Array,
+    sideLength: number,
+    format: PixelFormat = PixelFormat.PIXEL_FORMAT_PG7
+  ) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
@@ -148,7 +157,7 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     canvas.width = sideLength * PIXEL_SCALE;
     canvas.height = sideLength * PIXEL_SCALE;
 
-    const rgba = frameToRgba(bytes);
+    const rgba = frameToRgba(bytes, format);
     // Draw at 1x onto an offscreen buffer, then scale up with
     // nearest-neighbor via imageSmoothingEnabled = false.
     const off = document.createElement("canvas");
@@ -233,13 +242,16 @@ export function FrameViewer({ locked = false }: FrameViewerProps = {}) {
     }
     assemblers.delete(chunk.frameId);
 
+    // Old firmware never sets `format`, which decodes to the enum's zero
+    // value -- PIXEL_FORMAT_PG7, already the desired default.
+    const format = chunk.format ?? PixelFormat.PIXEL_FORMAT_PG7;
     const bytes = assembler.getBytes();
     let invalidCount = 0;
     for (const b of bytes) {
-      if ((b & 0x80) === 0) invalidCount++;
+      if (!isValidPixelByte(b, format)) invalidCount++;
     }
 
-    renderFrame(bytes, side);
+    renderFrame(bytes, side, format);
     setInvalidCount(invalidCount);
     setPixelCount(chunk.totalSize);
     setComplete(chunk.complete);

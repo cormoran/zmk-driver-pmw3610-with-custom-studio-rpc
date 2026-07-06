@@ -154,6 +154,21 @@ int pmw3610_set_force_awake(const struct device *dev, bool enabled);
 int pmw3610_set_smart_algorithm(const struct device *dev, bool enabled);
 int pmw3610_set_report_interval_min(const struct device *dev, uint32_t value_ms);
 
+/** @brief Byte format of the pixel data filled by a frame capture.
+ *
+ * Mirrors (but is intentionally independent of, per this header's no-nanopb
+ * policy) the proto `PixelFormat` enum -- keep the two in sync (0 = PG7,
+ * 1 = RAW8).
+ */
+enum pmw3610_pixel_format {
+    /** Per-pixel Pixel_Grab byte: bit7 = PG_VALID, bits[6:0] = pixel value.
+     * Produced by the 3-wire fallback path (disable-burst-read). */
+    PMW3610_PIXEL_FORMAT_PG7 = 0,
+    /** Full 8-bit pixel value, no per-pixel validity bit. Produced by the
+     * 4-wire FRAME_GRAB burst read (register 0x36/0x12). */
+    PMW3610_PIXEL_FORMAT_RAW8 = 1,
+};
+
 /** @brief Tunable knobs for pmw3610_capture_frame().
  *
  * The capture procedure follows the official PMW3610 datasheet (R2.4)
@@ -184,6 +199,9 @@ struct pmw3610_frame_capture_result {
     /** Wall-clock duration of the capture procedure (arm sequence through
      * the completion check), in milliseconds. */
     uint32_t duration_ms;
+    /** Byte format of the pixel data filled into buf (see
+     * enum pmw3610_pixel_format). */
+    enum pmw3610_pixel_format format;
 };
 
 /** @brief Capture a still frame (raw pixel array) from the sensor.
@@ -208,13 +226,20 @@ struct pmw3610_frame_capture_result {
  * pixel_count/max_invalid_retries, so a caller on the Studio RPC thread
  * cannot be blocked indefinitely by a misbehaving sensor.
  *
+ * Implemented as pmw3610_frame_capture_begin() -> _read() -> _end(), so a
+ * one-shot capture always resets afterwards (unchanged external behavior);
+ * see those functions' docs for the persistent multi-frame alternative
+ * used by streaming.
+ *
  * @param dev PMW3610 device.
  * @param params Capture tuning knobs (NULL uses all defaults).
- * @param buf Output buffer for raw pixel bytes (bit7 = PG_Valid, bits[6:0]
- *   = pixel value; the caller is responsible for masking/interpreting).
+ * @param buf Output buffer for raw pixel bytes: format PMW3610_PIXEL_FORMAT_PG7
+ *   (bit7 = PG_Valid, bits[6:0] = pixel value) on the 3-wire fallback path
+ *   (disable-burst-read), or PMW3610_PIXEL_FORMAT_RAW8 (full 8-bit pixel,
+ *   no validity bit) on the 4-wire burst path -- see result->format.
  * @param buf_len Capacity of buf, in bytes.
  * @param result Output capture result (collected count, completion flag,
- *   duration). Must not be NULL.
+ *   duration, format). Must not be NULL.
  * @return 0 on success (including a partial/early-aborted capture with
  *   result->pixel_count > 0), negative errno on failure (-ENODEV, -EINVAL
  *   for a zero buf_len or NULL result, -EBUSY if the device is not ready,
@@ -223,6 +248,84 @@ struct pmw3610_frame_capture_result {
 int pmw3610_capture_frame(const struct device *dev,
                           const struct pmw3610_frame_capture_params *params, uint8_t *buf,
                           uint16_t buf_len, struct pmw3610_frame_capture_result *result);
+
+/** @brief Begin a persistent frame-capture session (no per-frame reset).
+ *
+ * Takes the device's internal lock just long enough to require `data->ready`
+ * (else -EBUSY) and set an internal "capture active" flag, then disables the
+ * motion IRQ and -- once for the whole session -- forces the sensor into run
+ * mode (PERFORMANCE |= 0xF0) and confirms the mode switch landed (clear +
+ * poll OBSERVATION1), which can take up to ~700ms if the sensor was in a
+ * deep rest mode. This is the slow, one-time setup that
+ * pmw3610_frame_capture_read() no longer has to repeat on every frame.
+ *
+ * Call pmw3610_frame_capture_read() any number of times afterwards to
+ * capture successive frames without disturbing navigation between them,
+ * then pmw3610_frame_capture_end() exactly once to resume navigation
+ * (required by the datasheet) and release the session.
+ *
+ * @param dev PMW3610 device.
+ * @param params Capture tuning knobs, currently unused by begin() itself
+ *   (reserved for future per-session tuning); pass the same params intended
+ *   for the session's _read() calls, or NULL.
+ * @return 0 on success, -ENODEV for a NULL dev, -EBUSY if the device is not
+ *   ready (or a session is already active), or a negative SPI errno.
+ */
+int pmw3610_frame_capture_begin(const struct device *dev,
+                                const struct pmw3610_frame_capture_params *params);
+
+/** @brief Capture exactly one frame within an active session, with no reset.
+ *
+ * Must be called between a successful pmw3610_frame_capture_begin() and the
+ * matching pmw3610_frame_capture_end(). Takes `data->lock` for the duration
+ * of the read so a concurrent ReadRegister/WriteRegister RPC cannot
+ * interleave SPI transactions with the capture.
+ *
+ * On the 4-wire burst path (`!config->disable_burst_read`): (re-)arms
+ * FRAME_GRAB (PERFORMANCE force-run + SPI clock request + test clock 0x10 +
+ * FG_EN 0x36=0x80), waits for one fresh frame to latch, then issues a single
+ * burst read of up to `buf_len` bytes from MOTION_BURST (0x12).
+ * result->format is set to PMW3610_PIXEL_FORMAT_RAW8.
+ *
+ * On the 3-wire fallback path (`config->disable_burst_read`): runs the
+ * unchanged, official datasheet Pixel_Grab procedure (same as the
+ * standalone pmw3610_capture_frame(), steps 1-11) end to end -- this path
+ * is not optimized by the persistent session (see DESIGN.md Phase G scope
+ * notes); result->format is set to PMW3610_PIXEL_FORMAT_PG7.
+ *
+ * @param dev PMW3610 device.
+ * @param params Capture tuning knobs (NULL uses all defaults); same
+ *   semantics as pmw3610_capture_frame()'s params.
+ * @param buf Output buffer for raw pixel bytes.
+ * @param buf_len Capacity of buf, in bytes.
+ * @param result Output capture result (collected count, completion flag,
+ *   duration, format). Must not be NULL.
+ * @return 0 on success (including a partial capture), negative errno on
+ *   failure (-ENODEV, -EINVAL, or a SPI/timeout error). Does not return
+ *   -EBUSY for "no session active" -- callers are responsible for only
+ *   calling this between begin()/end().
+ */
+int pmw3610_frame_capture_read(const struct device *dev,
+                               const struct pmw3610_frame_capture_params *params, uint8_t *buf,
+                               uint16_t buf_len, struct pmw3610_frame_capture_result *result);
+
+/** @brief End a persistent frame-capture session, resuming navigation.
+ *
+ * Takes `data->lock`, runs the same power-up-reset + async re-init flow
+ * used by the one-shot pmw3610_capture_frame() (and by pmw3610_resume()'s
+ * not-ready path) to resume normal navigation, clears the internal
+ * "capture active"/"capture mode active" flags, and releases the lock. The
+ * motion IRQ re-enables once the async re-init flow reaches its last step,
+ * same as today.
+ *
+ * Safe to call even if pmw3610_frame_capture_begin() was never called or
+ * already failed (e.g. to unconditionally clean up) -- it is a no-op beyond
+ * the reset/re-init flow, which is itself idempotent.
+ *
+ * @param dev PMW3610 device.
+ * @return 0 on success, -ENODEV for a NULL dev.
+ */
+int pmw3610_frame_capture_end(const struct device *dev);
 
 #ifdef __cplusplus
 }

@@ -66,6 +66,38 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_LOG_LEVEL);
 // during Phase D hardware validation).
 #define PMW3610_FRAME_CAPTURE_TIMEOUT_MS 5000
 
+//////// Burst frame capture (FRAME_GRAB, register 0x36) defaults //////////
+// See DESIGN.md Phase G / docs/pmw3610.md "Frame Capture burst" (method 1)
+// and the reference Arduino sketch
+// (trackball-frame-visualizer/.../xiao_nRF52840_pmw3610_burst.ino). Used
+// only when `!config->disable_burst_read` (4-wire wiring, dedicated
+// MISO + CS/NCS); the 3-wire per-pixel PIXEL_GRAB path above is untouched.
+//
+// PERFORMANCE forced to exactly 0xF1 (not the read-modify-write
+// `(perf & 0x0F) | 0xF0` pmw3610_frame_capture_force_run_mode() uses) --
+// this is the literal value the burst procedure re-arms with on every
+// frame, matching the Arduino reference and DESIGN.md G.1 step 1.
+#define PMW3610_FRAME_GRAB_PERFORMANCE_FORCE_RUN 0xF1
+// Test clock "on" value for the burst path -- NOTE this differs from
+// PMW3610_TEST_CLK_ON (0x90) used by the per-pixel path above; the burst
+// variant is 0x10 (confirm on hardware, DESIGN.md G.1's byte-format
+// caveat).
+#define PMW3610_TEST_CLK_BURST_ON 0x10
+// FRAME_GRAB (0x36) enable bit ("FG_EN").
+#define PMW3610_FRAME_GRAB_ENABLE 0x80
+// Wait after arming FG_EN for one fresh frame to latch before the burst
+// read. This is the driver default when the request does not override it
+// (see the max_invalid_retries reinterpretation in
+// pmw3610_frame_capture_read()). Hardware validation (DESIGN.md G.6) swept
+// this on real hardware: coherent full frames hold down to 4ms (~78 fps),
+// but 3ms and below intermittently stream stale/garbled frames (still
+// reported complete). 5ms (~72 fps streaming) keeps one step of margin
+// above that 4ms boundary against sensor/scene/temperature variation. The
+// Arduino reference uses a more conservative fixed 10ms.
+#define PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MS 5
+// Clamp range for the request-supplied post-arm wait override.
+#define PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MAX_MS 100
+
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
 // delayable work is defined for this purpose           //
@@ -128,6 +160,55 @@ static int pmw3610_read(const struct device *dev, uint8_t addr, uint8_t *value, 
 
 static int pmw3610_read_reg(const struct device *dev, uint8_t addr, uint8_t *value) {
     return pmw3610_read(dev, addr, value, 1);
+}
+
+/* Max bytes per SPI sub-transfer for the burst frame read. The nRF SPIM
+ * EasyDMA truncates a single transfer at 255 bytes on this SoC even though
+ * the devicetree advertises 16-bit MAXCNT -- measured on hardware
+ * (DESIGN.md Phase G.6): a one-shot 484-byte read returns real data only
+ * through offset 254 and silently zero-fills the rest, with the cutoff at a
+ * fixed absolute offset of 255 independent of the requested length. Staying
+ * safely under 255 per sub-transfer avoids it. */
+#define PMW3610_BURST_MAX_XFER 240U
+/* 8 * 240 = 1920 px, well above the 484-pixel full frame -- an upper bound
+ * so the rx descriptor array can live on the stack. */
+#define PMW3610_BURST_MAX_SEGMENTS 8U
+
+/* Burst-read `len` pixel bytes from MOTION_BURST (0x12) in a SINGLE CS-held
+ * SPI transaction, presenting the destination as multiple
+ * <=PMW3610_BURST_MAX_XFER rx buffers so the nRF SPIM driver issues
+ * back-to-back EasyDMA transfers (each under the 255-byte cap above) with
+ * chip-select asserted the whole time. Chip-select must not toggle
+ * mid-frame: the sensor's frame-grab read pointer only advances while NCS is
+ * held low across the whole readout (matching the reference Arduino sketch's
+ * single NCS-low burst), so splitting into separate spi_transceive calls
+ * would re-read from pixel 0 each time. Caller holds data->lock. */
+static int pmw3610_burst_read_frame(const struct device *dev, uint8_t *buf, uint16_t len) {
+    const struct pixart_config *cfg = dev->config;
+    uint8_t addr = PMW3610_REG_MOTION_BURST;
+    const struct spi_buf tx_buf = {.buf = &addr, .len = sizeof(addr)};
+    const struct spi_buf_set tx = {.buffers = &tx_buf, .count = 1};
+
+    /* rx[0] discards the byte clocked out while `addr` is sent; the rest
+     * receive the frame in <=PMW3610_BURST_MAX_XFER segments. */
+    struct spi_buf rx_buf[1 + PMW3610_BURST_MAX_SEGMENTS];
+    size_t n = 0;
+    rx_buf[n++] = (struct spi_buf){.buf = NULL, .len = sizeof(addr)};
+
+    uint16_t off = 0;
+    while (off < len && n < ARRAY_SIZE(rx_buf)) {
+        uint16_t seg = MIN((uint16_t)PMW3610_BURST_MAX_XFER, (uint16_t)(len - off));
+        rx_buf[n++] = (struct spi_buf){.buf = &buf[off], .len = seg};
+        off += seg;
+    }
+    if (off < len) {
+        LOG_ERR("Frame capture (burst): %u px exceeds %u-segment budget", len,
+                PMW3610_BURST_MAX_SEGMENTS);
+        return -EINVAL;
+    }
+
+    const struct spi_buf_set rx = {.buffers = rx_buf, .count = n};
+    return spi_transceive_dt(&cfg->spi, &tx, &rx);
 }
 
 static int pmw3610_write_reg(const struct device *dev, uint8_t addr, uint8_t value) {
@@ -1250,9 +1331,255 @@ static int pmw3610_capture_wait_bit(const struct device *dev, uint8_t reg, uint8
     }
 }
 
-int pmw3610_capture_frame(const struct device *dev,
-                          const struct pmw3610_frame_capture_params *params, uint8_t *buf,
-                          uint16_t buf_len, struct pmw3610_frame_capture_result *result) {
+/* Force run mode and confirm it landed -- the "once per session" setup
+ * pmw3610_frame_capture_begin() does before any frame is captured. Extracted
+ * unchanged (same registers/logic) from the pre-Phase-G monolithic
+ * pmw3610_capture_frame(), just no longer repeated per frame.
+ *
+ * Force run mode for the duration of the capture: the OBSERVATION1 bits
+ * used as the per-pixel ready handshake are "set every frame" (datasheet),
+ * so the pixel cadence is the sensor's frame rate. A stationary sensor
+ * downshifts to Rest3 (~500ms/frame -- measured ~433ms/pixel during Phase D
+ * hardware validation, i.e. ~4 minutes for a full 484-pixel frame). Setting
+ * PERFORMANCE bits[7:4] = 0xF (force awake, same write
+ * pmw3610_set_performance() uses) keeps the sensor in Run mode; the
+ * post-capture power-up reset restores the register.
+ *
+ * Confirm run mode before arming: the force-run write only manifests at the
+ * next sensor frame boundary, which from Rest3 can be ~500ms away. Clear
+ * OBSERVATION1 (any write clears its bits), then wait for the frame bits to
+ * repopulate with the MODE bits (bits[7:6]) showing Run (00). Arming while
+ * the sensor is still in a rest mode makes the per-pixel ready bit follow
+ * the (much slower) rest frame cadence -- measured 30ms-budget misses in
+ * Rest1 (40ms/frame) and full-startup timeouts from Rest2/3 during Phase D
+ * hardware validation.
+ *
+ * Returns 0 on success, -ETIMEDOUT if the mode switch never landed within
+ * `deadline`, or a negative SPI errno. */
+static int pmw3610_frame_capture_force_run_mode(const struct device *dev, int64_t deadline) {
+    uint8_t perf = 0;
+    int err = pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &perf);
+    if (!err) {
+        err = pmw3610_write(dev, PMW3610_REG_PERFORMANCE, (perf & 0x0F) | 0xF0);
+    }
+    if (err) {
+        LOG_ERR("Frame capture: force-run PERFORMANCE write failed (errno %d)", err);
+        return err;
+    }
+
+    err = pmw3610_write_reg(dev, PMW3610_REG_OBSERVATION, 0x00);
+    if (err) {
+        LOG_ERR("Frame capture: OBSERVATION1 clear failed (errno %d)", err);
+        return err;
+    }
+
+    int64_t run_budget_end = k_uptime_get() + (int64_t)PMW3610_FRAME_CAPTURE_STARTUP_WAIT_RETRIES *
+                                                  PMW3610_FRAME_CAPTURE_WAIT_MS;
+    for (;;) {
+        uint8_t obs = 0;
+        err = pmw3610_read_reg(dev, PMW3610_REG_OBSERVATION, &obs);
+        if (err) {
+            LOG_ERR("Frame capture: OBSERVATION1 read failed (errno %d)", err);
+            return err;
+        }
+        /* Frame bits repopulated + MODE bits (bits[7:6]) == 00 (Run). */
+        if ((obs & 0x0F) != 0 && (obs & 0xC0) == 0) {
+            return 0;
+        }
+        int64_t now = k_uptime_get();
+        if (now >= run_budget_end || now >= deadline) {
+            LOG_WRN("Frame capture: sensor did not reach run mode (0x2D=0x%02x)", obs);
+            return -ETIMEDOUT;
+        }
+        k_sleep(K_MSEC(PMW3610_FRAME_CAPTURE_POLL_MS));
+    }
+}
+
+int pmw3610_frame_capture_begin(const struct device *dev,
+                                const struct pmw3610_frame_capture_params *params) {
+    ARG_UNUSED(params); /* reserved for future per-session tuning */
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    if (!data->ready) {
+        k_mutex_unlock(&data->lock);
+        return -EBUSY;
+    }
+    data->capture_active = true;
+    k_mutex_unlock(&data->lock);
+
+    /* Disable the motion IRQ outside the lock (matches pmw3610_set_interrupt
+     * usage elsewhere in this file, which does not require data->lock). */
+    pmw3610_set_interrupt(dev, false);
+
+    int64_t deadline = k_uptime_get() + PMW3610_FRAME_CAPTURE_TIMEOUT_MS;
+    int err = pmw3610_frame_capture_force_run_mode(dev, deadline);
+    if (err) {
+        /* Leave the sensor/driver in a navigable state rather than stuck
+         * with the IRQ disabled and no session to end() -- same cleanup
+         * pmw3610_frame_capture_end() does. */
+        LOG_WRN("Frame capture: begin() failed (errno %d), reverting", err);
+        k_mutex_lock(&data->lock, K_FOREVER);
+        pmw3610_capture_frame_recover_locked(dev);
+        data->capture_active = false;
+        data->capture_mode_active = false;
+        k_mutex_unlock(&data->lock);
+        return err;
+    }
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    data->capture_mode_active = true;
+    k_mutex_unlock(&data->lock);
+    return 0;
+}
+
+/* Single-helper "arm" for the burst FRAME_GRAB read, re-run every frame
+ * (matching the Arduino reference sketch -- see DESIGN.md Phase G.2's open
+ * "arm-once vs re-arm" experiment for hardware validation to settle
+ * later). DESIGN.md Phase G.1 steps 1-4; caller holds data->lock.
+ * `post_arm_wait_ms` is the fresh-frame-latch wait (see the macro). */
+static int pmw3610_frame_capture_arm_burst(const struct device *dev, uint16_t post_arm_wait_ms) {
+    int err =
+        pmw3610_write_reg(dev, PMW3610_REG_PERFORMANCE, PMW3610_FRAME_GRAB_PERFORMANCE_FORCE_RUN);
+    if (err) {
+        LOG_ERR("Frame capture (burst): PERFORMANCE force-run write failed (errno %d)", err);
+        return err;
+    }
+
+    err = pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
+    if (err) {
+        LOG_ERR("Frame capture (burst): SPI clock-on request failed (errno %d)", err);
+        return err;
+    }
+    k_sleep(K_USEC(T_CLOCK_ON_DELAY_US));
+
+    err = pmw3610_write_reg(dev, PMW3610_REG_TEST_CLK, PMW3610_TEST_CLK_BURST_ON);
+    if (err) {
+        LOG_ERR("Frame capture (burst): test clock write failed (errno %d)", err);
+        return err;
+    }
+
+    err = pmw3610_write_reg(dev, PMW3610_REG_FRAME_GRAB, PMW3610_FRAME_GRAB_ENABLE);
+    if (err) {
+        LOG_ERR("Frame capture (burst): FG_EN write failed (errno %d)", err);
+        return err;
+    }
+
+    k_sleep(K_MSEC(post_arm_wait_ms));
+    return 0;
+}
+
+/* 3-wire fallback: the unchanged, official datasheet Pixel_Grab procedure
+ * (steps 1-11) -- byte-for-byte the pre-Phase-G implementation, just
+ * factored out of the monolithic function. Do not alter this sequence (see
+ * DESIGN.md Phase G scope notes: the 3-wire path is a correctness fallback,
+ * not a performance target). Caller holds data->lock.
+ *
+ * Fills result->complete and returns the collected pixel count via
+ * *collected_out; returns 0 on success (including an early-aborted partial
+ * capture, signaled by -ETIMEDOUT), or a negative SPI errno. */
+static int pmw3610_frame_capture_read_pixel_grab_locked(const struct device *dev, uint8_t *buf,
+                                                        uint16_t pixel_count, uint16_t wait_retries,
+                                                        int64_t deadline,
+                                                        struct pmw3610_frame_capture_result *result,
+                                                        uint16_t *collected_out) {
+    uint16_t collected = 0;
+
+    /* Datasheet (R2.4) Pixel_Grab procedure, steps 1-7: arm the pixel
+     * grabber. Raw pmw3610_write_reg() on purpose -- the sequence manages
+     * the 0x41 SPI clock request itself (steps 1 and 5), so the
+     * pmw3610_write() clk-on/off wrapper must NOT be used here. */
+    static const uint8_t arm_seq[][2] = {
+        {PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE},     // 1) 0x41 = 0xBA
+        {PMW3610_REG_SPI_PAGE0, 0xFF},                                  // 2) 0x7F = 0xFF (page 1)
+        {PMW3610_REG_PIXEL_GRAB_MAGIC, PMW3610_PIXEL_GRAB_MAGIC_VALUE}, // 3) 0xB4 = 0xD7
+        {PMW3610_REG_SPI_PAGE0, 0x00},                                  // 4) 0x7F = 0x00 (page 0)
+        {PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE},    // 5) 0x41 = 0xB5
+        {PMW3610_REG_TEST_CLK, PMW3610_TEST_CLK_ON},                    // 6) 0x32 = 0x90
+        {PMW3610_REG_PIXEL_GRAB, PMW3610_PIXEL_GRAB_ARM},               // 7) 0x35 = 0x01
+    };
+
+    int err = 0;
+    for (size_t i = 0; i < ARRAY_SIZE(arm_seq); i++) {
+        err = pmw3610_write_reg(dev, arm_seq[i][0], arm_seq[i][1]);
+        if (err) {
+            LOG_ERR("Frame capture: arm step %u (reg 0x%02x) failed (errno %d)", (unsigned int)i,
+                    arm_seq[i][0], err);
+            goto pixel_grab_done;
+        }
+    }
+
+    /* Step 8: wait for PRBS_TEST_CTL (0x47) bit1 (pixel grab running).
+     * Startup budget: the sensor may still be waking from a rest mode
+     * (see PMW3610_FRAME_CAPTURE_STARTUP_WAIT_RETRIES). */
+    err = pmw3610_capture_wait_bit(dev, PMW3610_REG_PRBS_TEST_CTL, PMW3610_PRBS_READY_BIT,
+                                   PMW3610_FRAME_CAPTURE_STARTUP_WAIT_RETRIES, deadline);
+    if (err) {
+        LOG_WRN("Frame capture: PRBS ready (0x47 bit1) not set (errno %d)", err);
+        goto pixel_grab_done;
+    }
+
+    /* Steps 9-11, repeated per pixel: wait for OBSERVATION1 (0x2D) bit2,
+     * read PIXEL_GRAB (0x35), write OBSERVATION1 = 0x01 to advance. The
+     * first pixel also gets the startup budget (the frame that reflects
+     * run mode may not have happened yet); subsequent pixels arrive at
+     * run-mode frame rate and use the per-pixel budget. */
+    for (uint16_t i = 0; i < pixel_count; i++) {
+        uint16_t budget =
+            (i == 0) ? MAX(wait_retries, PMW3610_FRAME_CAPTURE_STARTUP_WAIT_RETRIES) : wait_retries;
+        err = pmw3610_capture_wait_bit(dev, PMW3610_REG_OBSERVATION,
+                                       PMW3610_OBSERVATION1_PIXEL_RDY_BIT, budget, deadline);
+        if (err) {
+            LOG_WRN("Frame capture: pixel %u not ready (0x2D bit2, errno %d), aborting with %u "
+                    "pixel(s) collected",
+                    i, err, collected);
+            goto pixel_grab_done;
+        }
+
+        uint8_t value;
+        err = pmw3610_read_reg(dev, PMW3610_REG_PIXEL_GRAB, &value);
+        if (err) {
+            LOG_ERR("Frame capture: PIXEL_GRAB read failed (errno %d) after %u pixel(s)", err,
+                    collected);
+            goto pixel_grab_done;
+        }
+        /* Store the raw byte (bit7 = PG_Valid kept) -- the host masks
+         * bits[6:0] and can inspect bit7 for capture quality. */
+        buf[collected++] = value;
+
+        err = pmw3610_write_reg(dev, PMW3610_REG_OBSERVATION, PMW3610_PIXEL_GRAB_ARM);
+        if (err) {
+            LOG_ERR("Frame capture: OBSERVATION1 advance write failed (errno %d) after %u "
+                    "pixel(s)",
+                    err, collected);
+            goto pixel_grab_done;
+        }
+    }
+
+    /* Step 12: PRBS_TEST_CTL (0x47) bit0 indicates all 484 pixels were
+     * read successfully. Informational -- a partial-frame request (< 484
+     * pixels) legitimately leaves it clear. */
+    {
+        uint8_t value;
+        int status_err = pmw3610_read_reg(dev, PMW3610_REG_PRBS_TEST_CTL, &value);
+        if (status_err) {
+            LOG_WRN("Frame capture: completion status read failed (errno %d)", status_err);
+        } else {
+            result->complete = (value & PMW3610_PRBS_COMPLETE_BIT) != 0;
+        }
+    }
+
+pixel_grab_done:
+    *collected_out = collected;
+    return err;
+}
+
+int pmw3610_frame_capture_read(const struct device *dev,
+                               const struct pmw3610_frame_capture_params *params, uint8_t *buf,
+                               uint16_t buf_len, struct pmw3610_frame_capture_result *result) {
     if (!dev) {
         return -ENODEV;
     }
@@ -1260,6 +1587,7 @@ int pmw3610_capture_frame(const struct device *dev,
         return -EINVAL;
     }
 
+    const struct pixart_config *config = dev->config;
     struct pixart_data *data = dev->data;
 
     uint16_t pixel_count = PMW3610_FRAME_CAPTURE_DEFAULT_PIXEL_COUNT;
@@ -1279,177 +1607,50 @@ int pmw3610_capture_frame(const struct device *dev,
 
     *result = (struct pmw3610_frame_capture_result){0};
 
-    k_mutex_lock(&data->lock, K_FOREVER);
-
-    if (!data->ready) {
-        k_mutex_unlock(&data->lock);
-        return -EBUSY;
-    }
-
-    data->capture_active = true;
-    k_mutex_unlock(&data->lock);
-
-    /* Disable the motion IRQ outside the lock (matches pmw3610_set_interrupt
-     * usage elsewhere in this file, which does not require data->lock). */
-    pmw3610_set_interrupt(dev, false);
-
     int64_t start = k_uptime_get();
     int64_t deadline = start + PMW3610_FRAME_CAPTURE_TIMEOUT_MS;
     uint16_t collected = 0;
-
-    /* Force run mode for the duration of the capture: the OBSERVATION1
-     * bits used as the per-pixel ready handshake are "set every frame"
-     * (datasheet), so the pixel cadence is the sensor's frame rate. A
-     * stationary sensor downshifts to Rest3 (~500ms/frame -- measured
-     * ~433ms/pixel during Phase D hardware validation, i.e. ~4 minutes
-     * for a full 484-pixel frame). Setting PERFORMANCE bits[7:4] = 0xF
-     * (force awake, same write pmw3610_set_performance() uses) keeps the
-     * sensor in Run mode so pixels advance at run-mode frame rate; the
-     * post-capture power-up reset restores the register. */
-    uint8_t perf = 0;
-    int err = pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &perf);
-    if (!err) {
-        err = pmw3610_write(dev, PMW3610_REG_PERFORMANCE, (perf & 0x0F) | 0xF0);
-    }
-    if (err) {
-        LOG_ERR("Frame capture: force-run PERFORMANCE write failed (errno %d)", err);
-        goto capture_done;
-    }
-
-    /* Confirm run mode before arming: the force-run write only manifests
-     * at the next sensor frame boundary, which from Rest3 can be ~500ms
-     * away. Clear OBSERVATION1 (any write clears its bits), then wait for
-     * the frame bits to repopulate with the MODE bits (bits[7:6]) showing
-     * Run (00). Arming while the sensor is still in a rest mode makes the
-     * per-pixel ready bit follow the (much slower) rest frame cadence --
-     * measured 30ms-budget misses in Rest1 (40ms/frame) and full-startup
-     * timeouts from Rest2/3 during Phase D hardware validation. */
-    err = pmw3610_write_reg(dev, PMW3610_REG_OBSERVATION, 0x00);
-    if (err) {
-        LOG_ERR("Frame capture: OBSERVATION1 clear failed (errno %d)", err);
-        goto capture_done;
-    }
-    {
-        int64_t run_budget_end =
-            k_uptime_get() +
-            (int64_t)PMW3610_FRAME_CAPTURE_STARTUP_WAIT_RETRIES * PMW3610_FRAME_CAPTURE_WAIT_MS;
-        for (;;) {
-            uint8_t obs = 0;
-            err = pmw3610_read_reg(dev, PMW3610_REG_OBSERVATION, &obs);
-            if (err) {
-                LOG_ERR("Frame capture: OBSERVATION1 read failed (errno %d)", err);
-                goto capture_done;
-            }
-            /* Frame bits repopulated + MODE bits (bits[7:6]) == 00 (Run). */
-            if ((obs & 0x0F) != 0 && (obs & 0xC0) == 0) {
-                break;
-            }
-            int64_t now = k_uptime_get();
-            if (now >= run_budget_end || now >= deadline) {
-                err = -ETIMEDOUT;
-                LOG_WRN("Frame capture: sensor did not reach run mode (0x2D=0x%02x)", obs);
-                goto capture_done;
-            }
-            k_sleep(K_MSEC(PMW3610_FRAME_CAPTURE_POLL_MS));
-        }
-    }
-
-    /* Datasheet (R2.4) Pixel_Grab procedure, steps 1-7: arm the pixel
-     * grabber. Raw pmw3610_write_reg() on purpose -- the sequence manages
-     * the 0x41 SPI clock request itself (steps 1 and 5), so the
-     * pmw3610_write() clk-on/off wrapper must NOT be used here. */
-    static const uint8_t arm_seq[][2] = {
-        {PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE},     // 1) 0x41 = 0xBA
-        {PMW3610_REG_SPI_PAGE0, 0xFF},                                  // 2) 0x7F = 0xFF (page 1)
-        {PMW3610_REG_PIXEL_GRAB_MAGIC, PMW3610_PIXEL_GRAB_MAGIC_VALUE}, // 3) 0xB4 = 0xD7
-        {PMW3610_REG_SPI_PAGE0, 0x00},                                  // 4) 0x7F = 0x00 (page 0)
-        {PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE},    // 5) 0x41 = 0xB5
-        {PMW3610_REG_TEST_CLK, PMW3610_TEST_CLK_ON},                    // 6) 0x32 = 0x90
-        {PMW3610_REG_PIXEL_GRAB, PMW3610_PIXEL_GRAB_ARM},               // 7) 0x35 = 0x01
-    };
-
-    for (size_t i = 0; i < ARRAY_SIZE(arm_seq); i++) {
-        err = pmw3610_write_reg(dev, arm_seq[i][0], arm_seq[i][1]);
-        if (err) {
-            LOG_ERR("Frame capture: arm step %u (reg 0x%02x) failed (errno %d)", (unsigned int)i,
-                    arm_seq[i][0], err);
-            goto capture_done;
-        }
-    }
-
-    /* Step 8: wait for PRBS_TEST_CTL (0x47) bit1 (pixel grab running).
-     * Startup budget: the sensor may still be waking from a rest mode
-     * (see PMW3610_FRAME_CAPTURE_STARTUP_WAIT_RETRIES). */
-    err = pmw3610_capture_wait_bit(dev, PMW3610_REG_PRBS_TEST_CTL, PMW3610_PRBS_READY_BIT,
-                                   PMW3610_FRAME_CAPTURE_STARTUP_WAIT_RETRIES, deadline);
-    if (err) {
-        LOG_WRN("Frame capture: PRBS ready (0x47 bit1) not set (errno %d)", err);
-        goto capture_done;
-    }
-
-    /* Steps 9-11, repeated per pixel: wait for OBSERVATION1 (0x2D) bit2,
-     * read PIXEL_GRAB (0x35), write OBSERVATION1 = 0x01 to advance. The
-     * first pixel also gets the startup budget (the frame that reflects
-     * run mode may not have happened yet); subsequent pixels arrive at
-     * run-mode frame rate and use the per-pixel budget. */
-    for (uint16_t i = 0; i < pixel_count; i++) {
-        uint16_t budget =
-            (i == 0) ? MAX(wait_retries, PMW3610_FRAME_CAPTURE_STARTUP_WAIT_RETRIES) : wait_retries;
-        err = pmw3610_capture_wait_bit(dev, PMW3610_REG_OBSERVATION,
-                                       PMW3610_OBSERVATION1_PIXEL_RDY_BIT, budget, deadline);
-        if (err) {
-            LOG_WRN("Frame capture: pixel %u not ready (0x2D bit2, errno %d), aborting with %u "
-                    "pixel(s) collected",
-                    i, err, collected);
-            goto capture_done;
-        }
-
-        uint8_t value;
-        err = pmw3610_read_reg(dev, PMW3610_REG_PIXEL_GRAB, &value);
-        if (err) {
-            LOG_ERR("Frame capture: PIXEL_GRAB read failed (errno %d) after %u pixel(s)", err,
-                    collected);
-            goto capture_done;
-        }
-        /* Store the raw byte (bit7 = PG_Valid kept) -- the host masks
-         * bits[6:0] and can inspect bit7 for capture quality. */
-        buf[collected++] = value;
-
-        err = pmw3610_write_reg(dev, PMW3610_REG_OBSERVATION, PMW3610_PIXEL_GRAB_ARM);
-        if (err) {
-            LOG_ERR("Frame capture: OBSERVATION1 advance write failed (errno %d) after %u "
-                    "pixel(s)",
-                    err, collected);
-            goto capture_done;
-        }
-    }
-
-    /* Step 12: PRBS_TEST_CTL (0x47) bit0 indicates all 484 pixels were
-     * read successfully. Informational -- a partial-frame request (< 484
-     * pixels) legitimately leaves it clear. */
-    {
-        uint8_t value;
-        int status_err = pmw3610_read_reg(dev, PMW3610_REG_PRBS_TEST_CTL, &value);
-        if (status_err) {
-            LOG_WRN("Frame capture: completion status read failed (errno %d)", status_err);
-        } else {
-            result->complete = (value & PMW3610_PRBS_COMPLETE_BIT) != 0;
-        }
-    }
-
-capture_done:
-    result->pixel_count = collected;
-    result->duration_ms = (uint32_t)(k_uptime_get() - start);
-    LOG_INF("Frame capture: %u pixel(s) in %u ms, complete=%d, err=%d", collected,
-            result->duration_ms, result->complete, err);
+    int err;
 
     k_mutex_lock(&data->lock, K_FOREVER);
-    pmw3610_capture_frame_recover_locked(dev);
-    data->capture_active = false;
-    k_mutex_unlock(&data->lock);
 
-    /* IRQ is re-enabled once async init reaches ASYNC_INIT_STEP_COUNT (see
-     * pmw3610_async_init()), matching pmw3610_resume()'s not-ready path. */
+    if (!config->disable_burst_read) {
+        result->format = PMW3610_PIXEL_FORMAT_RAW8;
+        /* Burst mode has no per-pixel ready handshake, so max_invalid_retries
+         * (the per-pixel-wait knob for the PIXEL_GRAB path) is meaningless
+         * here and is reinterpreted as a post-arm-wait override in ms -- the
+         * primary fps/reliability knob (DESIGN.md G.6). 0 = driver default. */
+        uint16_t post_arm_wait_ms = PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MS;
+        if (params && params->max_invalid_retries != 0) {
+            post_arm_wait_ms = CLAMP(params->max_invalid_retries, 1,
+                                     PMW3610_FRAME_CAPTURE_BURST_POST_ARM_WAIT_MAX_MS);
+        }
+        err = pmw3610_frame_capture_arm_burst(dev, post_arm_wait_ms);
+        if (!err) {
+            err = pmw3610_burst_read_frame(dev, buf, pixel_count);
+            if (!err) {
+                /* The burst transaction is all-or-nothing -- unlike
+                 * PIXEL_GRAB there is no partial/early-abort concept, so
+                 * "complete" just tracks whether the burst SPI transaction
+                 * itself succeeded. */
+                collected = pixel_count;
+                result->complete = true;
+            } else {
+                LOG_ERR("Frame capture (burst): MOTION_BURST read failed (errno %d)", err);
+            }
+        }
+    } else {
+        result->format = PMW3610_PIXEL_FORMAT_PG7;
+        err = pmw3610_frame_capture_read_pixel_grab_locked(dev, buf, pixel_count, wait_retries,
+                                                           deadline, result, &collected);
+    }
+
+    result->pixel_count = collected;
+    result->duration_ms = (uint32_t)(k_uptime_get() - start);
+    LOG_INF("Frame capture: %u pixel(s) in %u ms, complete=%d, format=%d, err=%d", collected,
+            result->duration_ms, result->complete, result->format, err);
+
+    k_mutex_unlock(&data->lock);
 
     if (err && err != -ETIMEDOUT) {
         return err;
@@ -1459,4 +1660,67 @@ capture_done:
      * pixels it still returns 0 so the caller can inspect the (empty)
      * result -- mirrors the previous abort-early behavior. */
     return 0;
+}
+
+int pmw3610_frame_capture_end(const struct device *dev) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    struct pixart_data *data = dev->data;
+
+    k_mutex_lock(&data->lock, K_FOREVER);
+    pmw3610_capture_frame_recover_locked(dev);
+    data->capture_active = false;
+    data->capture_mode_active = false;
+    k_mutex_unlock(&data->lock);
+
+    /* IRQ is re-enabled once async init reaches ASYNC_INIT_STEP_COUNT (see
+     * pmw3610_async_init()), matching pmw3610_resume()'s not-ready path. */
+    return 0;
+}
+
+int pmw3610_capture_frame(const struct device *dev,
+                          const struct pmw3610_frame_capture_params *params, uint8_t *buf,
+                          uint16_t buf_len, struct pmw3610_frame_capture_result *result) {
+    if (!dev) {
+        return -ENODEV;
+    }
+    if (!buf || buf_len == 0 || !result) {
+        return -EINVAL;
+    }
+
+    *result = (struct pmw3610_frame_capture_result){0};
+
+    int64_t start = k_uptime_get();
+    int err = pmw3610_frame_capture_begin(dev, params);
+    if (err == -EBUSY) {
+        /* Matches the pre-Phase-G contract: not-ready is reported before
+         * any partial result/duration is computed. */
+        return err;
+    }
+    if (err) {
+        /* begin() already reverted (recover + capture_active/
+         * capture_mode_active cleared) on this path. */
+        result->duration_ms = (uint32_t)(k_uptime_get() - start);
+        if (err == -ETIMEDOUT) {
+            /* Matches the pre-Phase-G contract: a run-mode-confirm timeout
+             * is reported as a successful call with an empty result, not a
+             * hard error. */
+            return 0;
+        }
+        return err;
+    }
+
+    err = pmw3610_frame_capture_read(dev, params, buf, buf_len, result);
+    /* read() set duration_ms to just its own elapsed time; overwrite with
+     * the total begin()+read() elapsed time (still excluding end()'s
+     * reset, same as the pre-Phase-G contract, which measured up to the
+     * completion check and not the recovery that follows it). */
+    result->duration_ms = (uint32_t)(k_uptime_get() - start);
+    /* Always end the session on the way out (mirrors the pre-Phase-G
+     * "always recover" behavior), regardless of read()'s outcome -- a
+     * one-shot capture always resets afterwards. */
+    pmw3610_frame_capture_end(dev);
+
+    return err;
 }

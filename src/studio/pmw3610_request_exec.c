@@ -304,7 +304,8 @@ static cormoran_pmw3610_Notification frame_stream_notification;
  * safe to reuse a single static buffer/mutex across calls -- matches
  * custom_settings_handler.c's raise_encoded_studio_notification(). */
 static int notify_frame_stream_chunk(uint32_t stream_frame_id, uint32_t offset, const uint8_t *data,
-                                     uint32_t len, uint32_t total_size, bool complete) {
+                                     uint32_t len, uint32_t total_size, bool complete,
+                                     cormoran_pmw3610_PixelFormat format) {
 #if !PMW3610_IS_SPLIT_PERIPHERAL
     int index = custom_subsystem_index();
     if (index < 0) {
@@ -332,6 +333,7 @@ static int notify_frame_stream_chunk(uint32_t stream_frame_id, uint32_t offset, 
      * the central (local stream) or a peripheral (source is meaningless
      * from the peripheral's own point of view; the central fills it in). */
     chunk->source = 0;
+    chunk->format = format;
 
     int ret;
 #if PMW3610_IS_SPLIT_PERIPHERAL
@@ -354,23 +356,76 @@ static int notify_frame_stream_chunk(uint32_t stream_frame_id, uint32_t offset, 
 
 /* Streaming state, guarded implicitly by running only on ZMK's dedicated
  * low-priority workqueue (frame_stream_work -- see zmk/workqueue.h; kept off
- * the system workqueue so a ~2s-per-frame capture loop cannot block
- * unrelated system workqueue consumers system-wide) and being set from the
- * RPC/relay-executor thread (which ZMK serializes one-request-at-a-time) --
- * no separate lock needed since the only cross-thread field is the bool
- * `frame_stream_active`, which is only ever read-modify-written as a whole. */
+ * the system workqueue so a capture loop cannot block unrelated system
+ * workqueue consumers system-wide) and being set from the RPC/relay-executor
+ * thread (which ZMK serializes one-request-at-a-time) -- no separate lock
+ * needed since the only cross-thread fields are the bools
+ * `frame_stream_active`/`frame_stream_session_active`, each only ever
+ * read-modify-written as a whole, and `frame_stream_active` is the sole
+ * field the RPC thread writes after the session starts (mirrors the
+ * pre-Phase-G synchronization argument).
+ *
+ * `frame_stream_active`: desired state (should the loop keep going).
+ * `frame_stream_session_active`: whether pmw3610_frame_capture_begin() has
+ * succeeded and pmw3610_frame_capture_end() has not yet run for it -- set by
+ * handle_set_frame_stream_request() right after a successful begin() (RPC
+ * thread), cleared by frame_stream_work_handler() itself (lowprio queue)
+ * once it calls end(). Whenever frame_stream_active is true there is always
+ * exactly one instance of frame_stream_work scheduled-or-running (the enable
+ * path schedules it once; the handler keeps self-rescheduling with
+ * K_NO_WAIT while active), so flipping frame_stream_active to false from
+ * any thread (SetFrameStream(false), the Studio lock listener, or the split
+ * disconnect listener) is enough to guarantee frame_stream_work_handler
+ * observes it on its very next run and ends the session there -- no
+ * separate "stop" work item is needed. */
 static bool frame_stream_active;
+static bool frame_stream_session_active;
 static uint32_t frame_stream_device_index;
 static uint16_t frame_stream_pixel_count;
 static uint16_t frame_stream_max_invalid_retries;
 
+/* Bounded retry budget for a transient (-ENOMEM) notification enqueue
+ * failure -- see the back-pressure comment in frame_stream_work_handler().
+ * 50 retries * 1ms = 50ms worst case per chunk before giving up and
+ * dropping the rest of the frame (matching the old break-on-error
+ * behavior only as a last resort, not the first response to a transient
+ * full ring). */
+#define PMW3610_FRAME_STREAM_NOTIFY_MAX_RETRIES 50
+
 static void frame_stream_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(frame_stream_work, frame_stream_work_handler);
+
+/* End the in-progress persistent capture session (if any) -- resumes
+ * navigation via pmw3610_frame_capture_end(). Always runs on the lowprio
+ * queue (called only from frame_stream_work_handler), the same place all
+ * other blocking SPI/capture calls for this feature already run. No-op if
+ * no session is active (e.g. begin() itself failed, or this stop path
+ * already ran once). */
+static void frame_stream_end_session_if_needed(void) {
+    if (!frame_stream_session_active) {
+        return;
+    }
+    size_t device_count = pmw3610_device_count();
+    if (frame_stream_device_index < device_count) {
+        pmw3610_frame_capture_end(pmw3610_get_device(frame_stream_device_index));
+    }
+    frame_stream_session_active = false;
+}
 
 static void frame_stream_work_handler(struct k_work *work) {
     ARG_UNUSED(work);
 
     if (!frame_stream_active) {
+        frame_stream_end_session_if_needed();
+        return;
+    }
+
+    if (!frame_stream_session_active) {
+        /* Defensive: should not happen -- handle_set_frame_stream_request()
+         * only sets frame_stream_active after a successful begin(). Stop
+         * rather than spin with nothing to read from. */
+        LOG_WRN("Frame stream: no active capture session, stopping");
+        frame_stream_active = false;
         return;
     }
 
@@ -383,6 +438,7 @@ static void frame_stream_work_handler(struct k_work *work) {
         LOG_WRN("Frame stream: device_index %u out of range (have %u device(s)), stopping",
                 (unsigned int)frame_stream_device_index, (unsigned int)device_count);
         frame_stream_active = false;
+        frame_stream_end_session_if_needed();
         return;
     }
     const struct device *dev = pmw3610_get_device(frame_stream_device_index);
@@ -392,10 +448,15 @@ static void frame_stream_work_handler(struct k_work *work) {
         .max_invalid_retries = frame_stream_max_invalid_retries,
     };
 
+    /* No reset between frames -- pmw3610_frame_capture_begin() already ran
+     * once when streaming started (see handle_set_frame_stream_request()).
+     * This is the dominant streaming-fps win (DESIGN.md Phase G.2): the
+     * previous per-iteration pmw3610_capture_frame() paid a full
+     * power-up-reset + async re-init on every single frame. */
     struct pmw3610_frame_capture_result capture = {0};
-    int err = pmw3610_capture_frame(dev, &params, frame_buf, sizeof(frame_buf), &capture);
+    int err = pmw3610_frame_capture_read(dev, &params, frame_buf, sizeof(frame_buf), &capture);
     if (err) {
-        LOG_WRN("Frame stream: CaptureFrame failed: errno %d", err);
+        LOG_WRN("Frame stream: capture read failed: errno %d", err);
     } else {
         frame_id++;
         frame_len = capture.pixel_count;
@@ -404,9 +465,25 @@ static void frame_stream_work_handler(struct k_work *work) {
              offset += PMW3610_FRAME_CHUNK_SIZE) {
             uint32_t remaining = capture.pixel_count - offset;
             uint32_t chunk_len = MIN(remaining, PMW3610_FRAME_CHUNK_SIZE);
-            int notify_err =
-                notify_frame_stream_chunk(frame_id, offset, &frame_buf[offset], chunk_len,
-                                          capture.pixel_count, capture.complete);
+
+            /* Retry a transient enqueue failure (e.g. -ENOMEM, a
+             * momentarily full Studio RPC TX ring over USB) instead of
+             * immediately dropping the rest of the frame -- this creates
+             * back-pressure (the loop briefly stalls) rather than a torn
+             * frame. Bounded so a genuinely broken transport still gives
+             * up instead of wedging this work item forever; any other
+             * error still aborts the frame immediately, matching the
+             * previous behavior. */
+            int notify_err = 0;
+            for (int attempt = 0; attempt < PMW3610_FRAME_STREAM_NOTIFY_MAX_RETRIES; attempt++) {
+                notify_err = notify_frame_stream_chunk(
+                    frame_id, offset, &frame_buf[offset], chunk_len, capture.pixel_count,
+                    capture.complete, (cormoran_pmw3610_PixelFormat)capture.format);
+                if (notify_err != -ENOMEM) {
+                    break;
+                }
+                k_sleep(K_MSEC(1));
+            }
             if (notify_err) {
                 LOG_WRN("Frame stream: failed to raise/relay notification: errno %d", notify_err);
                 break;
@@ -414,13 +491,15 @@ static void frame_stream_work_handler(struct k_work *work) {
         }
     }
 
-    /* Back-to-back reschedule with no artificial delay: pmw3610_capture_frame()
-     * blocks for ~2s per 484-pixel frame (measured in Phase D), which already
-     * paces the loop far below any transport throughput concern. Hardware
-     * testing (Phase E validation) should confirm no transport overrun
-     * before adding an inter-frame delay here. */
+    /* Back-to-back reschedule with no artificial delay: pmw3610_frame_capture_read()
+     * (~15ms measured for the burst path in DESIGN.md Phase G) already paces
+     * the loop; capture(N+1) overlaps the async USB drain of frame N's
+     * notifications. Hardware validation (Phase G.6) confirms no transport
+     * overrun before adding an inter-frame delay here. */
     if (frame_stream_active) {
         k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &frame_stream_work, K_NO_WAIT);
+    } else {
+        frame_stream_end_session_if_needed();
     }
 }
 
@@ -430,6 +509,25 @@ static void handle_set_frame_stream_request(const cormoran_pmw3610_SetFrameStrea
         const struct device *dev = resolve_device(req->device_index, resp);
         if (!dev) {
             return;
+        }
+
+        if (!frame_stream_active) {
+            /* Starting a new session: begin() once (may take up to ~700ms
+             * if the sensor was in a deep rest mode -- see
+             * pmw3610_frame_capture_begin()'s docs), surfaced as an error
+             * response on failure with streaming left off. */
+            struct pmw3610_frame_capture_params params = {
+                .pixel_count = (uint16_t)MIN(
+                    req->pixel_count, (uint32_t)CONFIG_ZMK_PMW3610_STUDIO_RPC_FRAME_BUF_SIZE),
+                .max_invalid_retries =
+                    (uint16_t)MIN(req->max_invalid_retries, (uint32_t)UINT16_MAX),
+            };
+            int err = pmw3610_frame_capture_begin(dev, &params);
+            if (err) {
+                set_error(resp, "SetFrameStream: failed to begin capture session: errno %d", err);
+                return;
+            }
+            frame_stream_session_active = true;
         }
 
         frame_stream_device_index = req->device_index;
@@ -463,6 +561,10 @@ static void handle_set_frame_stream_request(const cormoran_pmw3610_SetFrameStrea
  * while unlocked would keep emitting notifications after a later auto-lock.
  * Central/non-split only: Studio lock state does not exist on a split
  * peripheral. */
+/* Just flips the desired-state flag -- frame_stream_work_handler() (see
+ * above) notices on its next run (always scheduled-or-running while
+ * frame_stream_active is true) and calls pmw3610_frame_capture_end() there,
+ * on the lowprio queue, to actually reset the sensor/resume navigation. */
 static int on_studio_core_lock_state_changed(const zmk_event_t *eh) {
     struct zmk_studio_core_lock_state_changed *ev = as_zmk_studio_core_lock_state_changed(eh);
     if (!ev) {
@@ -485,6 +587,7 @@ ZMK_SUBSCRIPTION(zmk_pmw3610_studio_lock_listener, zmk_studio_core_lock_state_ch
  * relaying chunks up would otherwise keep running (and failing to relay,
  * since zmk_split_peripheral_report_event() has nowhere to send to) forever
  * once disconnected from the central. */
+/* Same "just flip the flag" pattern as the Studio lock listener above. */
 #include <zmk/events/split_peripheral_status_changed.h>
 
 static int on_split_peripheral_status_changed(const zmk_event_t *eh) {
@@ -540,6 +643,7 @@ static void handle_capture_frame_request(const cormoran_pmw3610_CaptureFrameRequ
     result.chunk_size = PMW3610_FRAME_CHUNK_SIZE;
     result.complete = capture.complete;
     result.duration_ms = capture.duration_ms;
+    result.format = (cormoran_pmw3610_PixelFormat)capture.format;
 
     resp->which_response_type = cormoran_pmw3610_Response_capture_frame_tag;
     resp->response_type.capture_frame = result;
