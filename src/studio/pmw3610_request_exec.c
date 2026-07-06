@@ -6,6 +6,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
 #include <zmk/event_manager.h>
+#include <zmk/workqueue.h>
 
 #include <cormoran/pmw3610/pmw3610.pb.h>
 #include <cormoran/pmw3610/pmw3610_api.h>
@@ -351,11 +352,13 @@ static int notify_frame_stream_chunk(uint32_t stream_frame_id, uint32_t offset, 
     return ret;
 }
 
-/* Streaming state, guarded implicitly by running only on the system
- * workqueue (frame_stream_work) and being set from the RPC/relay-executor
- * thread (which ZMK serializes one-request-at-a-time) -- no separate lock
- * needed since the only cross-thread field is the bool `frame_stream_active`,
- * which is only ever read-modify-written as a whole. */
+/* Streaming state, guarded implicitly by running only on ZMK's dedicated
+ * low-priority workqueue (frame_stream_work -- see zmk/workqueue.h; kept off
+ * the system workqueue so a ~2s-per-frame capture loop cannot block
+ * unrelated system workqueue consumers system-wide) and being set from the
+ * RPC/relay-executor thread (which ZMK serializes one-request-at-a-time) --
+ * no separate lock needed since the only cross-thread field is the bool
+ * `frame_stream_active`, which is only ever read-modify-written as a whole. */
 static bool frame_stream_active;
 static uint32_t frame_stream_device_index;
 static uint16_t frame_stream_pixel_count;
@@ -417,7 +420,7 @@ static void frame_stream_work_handler(struct k_work *work) {
      * testing (Phase E validation) should confirm no transport overrun
      * before adding an inter-frame delay here. */
     if (frame_stream_active) {
-        k_work_reschedule(&frame_stream_work, K_NO_WAIT);
+        k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &frame_stream_work, K_NO_WAIT);
     }
 }
 
@@ -438,7 +441,8 @@ static void handle_set_frame_stream_request(const cormoran_pmw3610_SetFrameStrea
         bool already_active = frame_stream_active;
         frame_stream_active = true;
         if (!already_active) {
-            k_work_reschedule(&frame_stream_work, K_NO_WAIT);
+            k_work_reschedule_for_queue(zmk_workqueue_lowprio_work_q(), &frame_stream_work,
+                                        K_NO_WAIT);
         }
     } else {
         frame_stream_active = false;

@@ -755,20 +755,65 @@ Everything below was design; implementation status per stage (F.6):
 
 ### Hardware validation status (2026-07)
 
-No PMW3610 sensor or split-capable board pair was attached in this
-environment. F-a through F-f were validated at the build/native_sim/
-web-test level only (see above) — not against a real sensor's persisted
-`cpi@<id>` value across reboot, nor a real two-half split link exercising
-the actual BLE relay transport (only the peripheral-side executor logic was
-exercised, via a local self-test bypassing the transport — this covers
-correctness of "given this decoded request, is the local execution/response
-right", not the wire relay itself, BLE MTU chunking of a >MTU relay event,
-or real-world timing/loss behavior), nor the web UI's relay correlation
-against a real firmware round-trip (only unit-tested against synthetic
-notification payloads). Re-run the "Validation plan (hardware)" steps below
-(extended with a second device / settings-id / a real second half / a real
-SetFrameStream from a peripheral, driven from the web UI's new "Split
-source" input) once hardware is available.
+Confirmed end-to-end on real hardware (2 physical XIAO nRF52840 boards, one
+with a real PMW3610 sensor wired as the split peripheral, one as split
+central, both over a real BLE split link): a Studio RPC `GetInfo{source: 1}`
+sent to the central's `cormoran__pmw3610` subsystem returns an immediate
+`DeferredResponse`, the peripheral executes the relayed request against its
+real local PMW3610 (`product_id: 62` / 0x3E, `ready: true`, full
+`runtime_config`), and the central re-raises the relayed `RelayResponse` as
+a `PeripheralResponse` Studio notification carrying that real device data
+back to the client — the full round trip this design's relay bridge exists
+for.
+
+Getting there surfaced a real firmware bug, since fixed (see below): the
+peripheral's relay-request executor originally ran synchronously on
+whichever thread ZMK core's split relay dispatch happened to use (the
+system workqueue on both roles), and with this subsystem's ~230-byte
+relayed messages that call chain (decode → `pmw3610_request_exec_handle()`
+→ nanopb-encode → ZMK core's own relay-out path) overflowed the default
+2048-byte system workqueue stack — an MPU fault / stack overflow, confirmed
+via RTT, that silently killed the response before it ever reached central
+(the request-side `DeferredResponse` still came back fine, since that part
+completes before the crash). Fixed by moving every relay listener in
+`src/split/pmw3610_relay.c`, plus frame streaming's capture loop in
+`src/studio/pmw3610_request_exec.c` (same system-workqueue exposure, worse
+in degree since it blocks for ~2s per captured frame), off the system
+workqueue entirely and onto ZMK core's own dedicated low-priority workqueue
+(`zmk_workqueue_lowprio_work_q()`, `app/src/workqueue.c` — the same queue
+ZMK core itself uses for GATT notify work in `gatt_rpc_transport.c`, for the
+identical reason). Each listener now copies its event payload into a static
+buffer and submits a `k_work` item to that queue instead of processing
+inline; `CONFIG_ZMK_PMW3610_PROTOBUF` now `select`s
+`ZMK_LOW_PRIORITY_WORK_QUEUE`, and the split-rpc-relay snippet sizes
+`CONFIG_ZMK_LOW_PRIORITY_THREAD_STACK_SIZE=4096` for it. This is strictly
+better than the system-workqueue-stack-size band-aid it replaces: the low
+priority queue's stack is dedicated to latency-tolerant, deliberately
+deferred work, so sizing it for this subsystem's worst case doesn't bloat
+every other system workqueue consumer's headroom requirement, and a slow
+protobuf pass (or frame streaming's capture loop) can no longer block
+unrelated system workqueue work (BLE housekeeping, HID reports,
+keyscan-deferred work, ...) system-wide.
+
+Also confirmed while debugging the above: repeatedly halting either board's
+CPU via J-Link (e.g. for RTT log capture) while its BLE softdevice link is
+live is itself capable of destabilizing the connection (observed as a
+kernel oops / an apparent reconnect stall on the central) — a rig/tooling
+caveat for future hardware sessions on this or any BLE-softdevice-based
+board, not a firmware bug. Reading RTT logs without first zeroing the
+`_SEGGER_RTT` control block's signature (forcing a fresh `WrOff`/`RdOff` on
+next boot) is also unreliable across resets/reflashes: the ring buffer
+retains stale bytes from earlier sessions at offsets the current session
+hasn't reached yet, which briefly looked like a *recurring* crash before
+this was understood to be one stale capture read twice.
+
+Not yet exercised on hardware: a real sensor's persisted `cpi@<id>` value
+across reboot, more than one PMW3610 on the same half, a real
+`SetFrameStream` from a peripheral driven from the web UI's "Split source"
+input, and `GetInfo{source: PMW3610_SOURCE_ALL}`'s broadcast-across-every-
+peripheral path (F-f) with more than one peripheral attached. Re-run the
+"Validation plan (hardware)" steps below for those once a second peripheral
+or a persisted-settings scenario is available.
 
 Facts about the dependencies below were verified against the checked-out
 sources (paths cited).

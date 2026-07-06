@@ -178,6 +178,15 @@ config ZMK_PMW3610_PROTOBUF
     imply NANOPB_NO_ERRMSG
     imply NANOPB_WITHOUT_64BIT
     imply NANOPB_NO_ENCODE_SIZE_CHECK
+    # Frame streaming's capture loop (src/studio/pmw3610_request_exec.c) and,
+    # when ZMK_PMW3610_SPLIT_RPC_RELAY is also on, every split relay listener
+    # (src/split/pmw3610_relay.c) defer their protobuf decode/exec/encode
+    # work onto ZMK's dedicated low-priority workqueue instead of running
+    # inline on whichever caller thread (system workqueue, in most cases)
+    # dispatched them -- see the file-level comment in pmw3610_relay.c for
+    # why (a real stack overflow on the system workqueue, confirmed on
+    # hardware, from exactly this work running there).
+    select ZMK_LOW_PRIORITY_WORK_QUEUE
 
 config ZMK_PMW3610_CUSTOM_SETTINGS
     bool "Enable PMW3610 runtime settings via zmk-feature-custom-settings"
