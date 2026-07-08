@@ -117,100 +117,25 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define PMW3610_REST2_DOWNSHIFT_MIN (128 * PMW3610_DEFAULT_REST2_SAMPLE_MS)
 #define PMW3610_REST2_DOWNSHIFT_MAX (255 * 128 * PMW3610_DEFAULT_REST2_SAMPLE_MS)
 
-/* NOTE: constraints are built with plain designated-initializer syntax
- * (no ZMK_CUSTOM_SETTING_RANGE_INT32()/_NO_CONSTRAINT compound-literal
- * macros) and defined directly with STRUCT_SECTION_ITERABLE (bypassing the
- * ZMK_CUSTOM_SETTING_DEFINE() convenience macro), matching the pattern used
- * by zmk-feature-custom-settings' own
- * src/test/zmk_config_sample_settings.c. This is *not* just a style choice:
- * ZMK_CUSTOM_SETTING_DEFINE()'s constraint argument is placed inside another
- * static array initializer (`_name##_constraints[] = {__VA_ARGS__}`), and
- * ZMK_CUSTOM_SETTING_RANGE_INT32() itself expands to a *nested* compound
- * literal (a compound-literal .range field whose .min/.max members are
- * themselves compound literals via ZMK_CUSTOM_SETTING_VALUE_INT32()).
- * Nested compound literals are not permitted inside a static/file-scope
- * initializer per C11 6.6p9, and arm-zephyr-eabi-gcc (unlike some other
- * compilers on some other constructs) enforces this strictly, failing with
- * "initializer element is not constant". Plain nested brace-initializers
- * (no cast, as used below) don't have this problem. */
-
-static const struct zmk_custom_setting_constraint pmw3610_no_constraint[] = {
-    {.type = ZMK_CUSTOM_SETTING_CONSTRAINT_NONE},
-};
-
-static const struct zmk_custom_setting_constraint pmw3610_cpi_constraint[] = {
-    {.type = ZMK_CUSTOM_SETTING_CONSTRAINT_RANGE,
-     .range = {.min = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = 200},
-               .max = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = 3200}}},
-};
-
-static const struct zmk_custom_setting_constraint pmw3610_run_downshift_constraint[] = {
-    {.type = ZMK_CUSTOM_SETTING_CONSTRAINT_RANGE,
-     .range = {.min = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = 32},
-               .max = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = 8160}}},
-};
-
-static const struct zmk_custom_setting_constraint pmw3610_rest1_downshift_constraint[] = {
-    {.type = ZMK_CUSTOM_SETTING_CONSTRAINT_RANGE,
-     .range = {.min = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,
-                       .int32_value = PMW3610_REST1_DOWNSHIFT_MIN},
-               .max = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,
-                       .int32_value = PMW3610_REST1_DOWNSHIFT_MAX}}},
-};
-
-static const struct zmk_custom_setting_constraint pmw3610_rest2_downshift_constraint[] = {
-    {.type = ZMK_CUSTOM_SETTING_CONSTRAINT_RANGE,
-     .range = {.min = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,
-                       .int32_value = PMW3610_REST2_DOWNSHIFT_MIN},
-               .max = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,
-                       .int32_value = PMW3610_REST2_DOWNSHIFT_MAX}}},
-};
-
-static const struct zmk_custom_setting_constraint pmw3610_sample_ms_constraint[] = {
-    {.type = ZMK_CUSTOM_SETTING_CONSTRAINT_RANGE,
-     .range = {.min = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = 10},
-               .max = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = 2550}}},
-};
-
-static const struct zmk_custom_setting_constraint pmw3610_report_interval_constraint[] = {
-    {.type = ZMK_CUSTOM_SETTING_CONSTRAINT_RANGE,
-     .range = {.min = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = 0},
-               .max = {.type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = 1000}}},
-};
-
+/* Thin wrappers over zmk-feature-custom-settings' registration macro, fixing
+ * the common fields (subsystem id, RPC-public, unsecure read/write) so each
+ * per-instance definition below is a single line. _key is a per-instance
+ * mutable buffer whose contents are filled at boot (see below); the macro only
+ * stores the pointer. _constraint is one constraint expression, e.g.
+ * ZMK_CUSTOM_SETTING_RANGE_INT32(lo, hi) or ZMK_CUSTOM_SETTING_NO_CONSTRAINT. */
 #define PMW3610_SETTING_INT32(_name, _key, _default, _constraint)                                  \
-    static const struct zmk_custom_setting_value _name##_default_value = {                         \
-        .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32, .int32_value = (_default)};                   \
-    STRUCT_SECTION_ITERABLE(zmk_custom_setting, _name) = {                                         \
-        .custom_subsystem_id = PMW3610_SETTINGS_SUBSYSTEM_ID,                                      \
-        .key = (_key),                                                                             \
-        .array_index = ZMK_CUSTOM_SETTING_ARRAY_NONE,                                              \
-        .value_type = ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,                                         \
-        .confidentiality = ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,                          \
-        .read_permission = ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,                                 \
-        .write_permission = ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,                                \
-        .constraints = (_constraint),                                                              \
-        .constraints_count = ARRAY_SIZE(_constraint),                                              \
-        .default_value = &_name##_default_value,                                                   \
-        .temp_slot = -1,                                                                           \
-    }
+    ZMK_CUSTOM_SETTING_DEFINE(                                                                     \
+        _name, PMW3610_SETTINGS_SUBSYSTEM_ID, _key, ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,           \
+        ZMK_CUSTOM_SETTING_VALUE_INT32(_default), ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,   \
+        ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE, ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,            \
+        _constraint)
 
 #define PMW3610_SETTING_BOOL(_name, _key, _default)                                                \
-    static const struct zmk_custom_setting_value _name##_default_value = {                         \
-        .type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL, .bool_value = (_default)};                      \
-    STRUCT_SECTION_ITERABLE(zmk_custom_setting, _name) = {                                         \
-        .custom_subsystem_id = PMW3610_SETTINGS_SUBSYSTEM_ID,                                      \
-        .key = (_key),                                                                             \
-        .array_index = ZMK_CUSTOM_SETTING_ARRAY_NONE,                                              \
-        .value_type = ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL,                                          \
-        .confidentiality = ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,                          \
-        .read_permission = ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,                                 \
-        .write_permission = ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,                                \
-        .constraints = pmw3610_no_constraint,                                                      \
-        .constraints_count = ARRAY_SIZE(pmw3610_no_constraint),                                    \
-        .default_value = &_name##_default_value,                                                   \
-        .temp_slot = -1,                                                                           \
-    }
+    ZMK_CUSTOM_SETTING_DEFINE(                                                                     \
+        _name, PMW3610_SETTINGS_SUBSYSTEM_ID, _key, ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL,            \
+        ZMK_CUSTOM_SETTING_VALUE_BOOL(_default), ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,    \
+        ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE, ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,            \
+        ZMK_CUSTOM_SETTING_NO_CONSTRAINT)
 
 /* --- Per-instance key storage + settings entries ----------------------- */
 /*
@@ -255,7 +180,8 @@ DT_INST_FOREACH_STATUS_OKAY(PMW3610_DECLARE_INST_STORAGE)
  * settings remove that limitation). */
 #define PMW3610_DEFINE_INST_SETTINGS(n)                                                            \
     PMW3610_SETTING_INT32(pmw3610_setting_##n##_cpi, PMW3610_INST_KEY_VAR(n, cpi),                 \
-                          DT_INST_PROP_OR(n, cpi, 600), pmw3610_cpi_constraint);                   \
+                          DT_INST_PROP_OR(n, cpi, 600),                                            \
+                          ZMK_CUSTOM_SETTING_RANGE_INT32(200, 3200));                              \
     PMW3610_SETTING_BOOL(pmw3610_setting_##n##_swap_xy, PMW3610_INST_KEY_VAR(n, swap_xy),          \
                          IS_ENABLED(CONFIG_PMW3610_SWAP_XY));                                      \
     PMW3610_SETTING_BOOL(pmw3610_setting_##n##_invert_x, PMW3610_INST_KEY_VAR(n, invert_x),        \
@@ -267,27 +193,30 @@ DT_INST_FOREACH_STATUS_OKAY(PMW3610_DECLARE_INST_STORAGE)
     PMW3610_SETTING_BOOL(pmw3610_setting_##n##_smart_algorithm,                                    \
                          PMW3610_INST_KEY_VAR(n, smart_algorithm),                                 \
                          IS_ENABLED(CONFIG_PMW3610_SMART_ALGORITHM));                              \
-    PMW3610_SETTING_INT32(pmw3610_setting_##n##_run_downshift_ms,                                  \
-                          PMW3610_INST_KEY_VAR(n, run_downshift_ms),                               \
-                          CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS, pmw3610_run_downshift_constraint); \
+    PMW3610_SETTING_INT32(                                                                         \
+        pmw3610_setting_##n##_run_downshift_ms, PMW3610_INST_KEY_VAR(n, run_downshift_ms),         \
+        CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS, ZMK_CUSTOM_SETTING_RANGE_INT32(32, 8160));           \
     PMW3610_SETTING_INT32(                                                                         \
         pmw3610_setting_##n##_rest1_downshift_ms, PMW3610_INST_KEY_VAR(n, rest1_downshift_ms),     \
-        CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS, pmw3610_rest1_downshift_constraint);               \
+        CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS,                                                    \
+        ZMK_CUSTOM_SETTING_RANGE_INT32(PMW3610_REST1_DOWNSHIFT_MIN, PMW3610_REST1_DOWNSHIFT_MAX)); \
     PMW3610_SETTING_INT32(                                                                         \
         pmw3610_setting_##n##_rest2_downshift_ms, PMW3610_INST_KEY_VAR(n, rest2_downshift_ms),     \
-        CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS, pmw3610_rest2_downshift_constraint);               \
-    PMW3610_SETTING_INT32(pmw3610_setting_##n##_rest1_sample_ms,                                   \
-                          PMW3610_INST_KEY_VAR(n, rest1_sample_ms),                                \
-                          PMW3610_DEFAULT_REST1_SAMPLE_MS, pmw3610_sample_ms_constraint);          \
-    PMW3610_SETTING_INT32(pmw3610_setting_##n##_rest2_sample_ms,                                   \
-                          PMW3610_INST_KEY_VAR(n, rest2_sample_ms),                                \
-                          PMW3610_DEFAULT_REST2_SAMPLE_MS, pmw3610_sample_ms_constraint);          \
-    PMW3610_SETTING_INT32(pmw3610_setting_##n##_rest3_sample_ms,                                   \
-                          PMW3610_INST_KEY_VAR(n, rest3_sample_ms),                                \
-                          CONFIG_PMW3610_REST3_SAMPLE_TIME_MS, pmw3610_sample_ms_constraint);      \
+        CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS,                                                    \
+        ZMK_CUSTOM_SETTING_RANGE_INT32(PMW3610_REST2_DOWNSHIFT_MIN, PMW3610_REST2_DOWNSHIFT_MAX)); \
+    PMW3610_SETTING_INT32(                                                                         \
+        pmw3610_setting_##n##_rest1_sample_ms, PMW3610_INST_KEY_VAR(n, rest1_sample_ms),           \
+        PMW3610_DEFAULT_REST1_SAMPLE_MS, ZMK_CUSTOM_SETTING_RANGE_INT32(10, 2550));                \
+    PMW3610_SETTING_INT32(                                                                         \
+        pmw3610_setting_##n##_rest2_sample_ms, PMW3610_INST_KEY_VAR(n, rest2_sample_ms),           \
+        PMW3610_DEFAULT_REST2_SAMPLE_MS, ZMK_CUSTOM_SETTING_RANGE_INT32(10, 2550));                \
+    PMW3610_SETTING_INT32(                                                                         \
+        pmw3610_setting_##n##_rest3_sample_ms, PMW3610_INST_KEY_VAR(n, rest3_sample_ms),           \
+        CONFIG_PMW3610_REST3_SAMPLE_TIME_MS, ZMK_CUSTOM_SETTING_RANGE_INT32(10, 2550));            \
     PMW3610_SETTING_INT32(pmw3610_setting_##n##_report_interval_min_ms,                            \
                           PMW3610_INST_KEY_VAR(n, report_interval_min_ms),                         \
-                          CONFIG_PMW3610_REPORT_INTERVAL_MIN, pmw3610_report_interval_constraint);
+                          CONFIG_PMW3610_REPORT_INTERVAL_MIN,                                      \
+                          ZMK_CUSTOM_SETTING_RANGE_INT32(0, 1000));
 
 DT_INST_FOREACH_STATUS_OKAY(PMW3610_DEFINE_INST_SETTINGS)
 
