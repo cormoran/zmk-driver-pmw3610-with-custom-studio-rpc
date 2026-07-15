@@ -13,11 +13,25 @@
  * PMW3610 device's runtime config in sync with its own effective setting
  * values:
  *
- *  - At boot: pmw3610_settings_apply_to_device() is called by the driver
- *    itself from pmw3610_async_init_configure() (see
- *    include/cormoran/pmw3610/pmw3610_settings_apply.h for why that call
- *    site -- rather than a SYS_INIT hook here -- avoids a boot-ordering
- *    race against zmk-feature-custom-settings' own settings_load()).
+ *  - At boot: two apply points, deliberately redundant, so the effective
+ *    (persisted-or-default) values always reach the sensor regardless of the
+ *    relative timing of settings_load() and the driver's async init:
+ *      1. pmw3610_settings_apply_to_device() is called by the driver itself
+ *         from pmw3610_async_init_configure() (see
+ *         include/cormoran/pmw3610/pmw3610_settings_apply.h). That call site
+ *         handles the common case where settings_load() has already finished
+ *         by the time async init reaches its CONFIGURE step (~260ms in).
+ *      2. A zmk_custom_settings_initialized listener re-applies every device
+ *         once. zmk-feature-custom-settings raises that event exactly once per
+ *         boot, strictly after settings_load() has populated every setting's
+ *         effective (persisted-or-default) value. This is the deterministic
+ *         backstop: unlike the async-init timer, it is guaranteed to run
+ *         *after* the persisted values are in memory, so a slow
+ *         settings_load() (e.g. a large NVS with BLE bonds, which can outlast
+ *         the ~260ms async-init delay) can no longer leave the sensor stuck on
+ *         compiled-in defaults. Without it, the async-init apply losing that
+ *         race would never be corrected (the plain settings-load path raises
+ *         no zmk_custom_setting_changed event).
  *  - At runtime: a zmk_custom_setting_changed listener re-applies every
  *    device's current effective values (each device only ever reads its
  *    own per-device keys, so this is "wasteful but correct", not
@@ -337,7 +351,17 @@ static void pmw3610_settings_apply_to_all_devices(void) {
     }
 }
 
-static int pmw3610_settings_changed_listener(const zmk_event_t *eh) {
+static int pmw3610_settings_event_listener(const zmk_event_t *eh) {
+    /* Deterministic boot-time apply (see this file's header comment, point 2):
+     * zmk-feature-custom-settings raises zmk_custom_settings_initialized once
+     * per boot, strictly after settings_load() has populated every setting's
+     * effective value -- so reading them here is race-free, unlike the
+     * async-init timer. Re-apply every device's persisted values. */
+    if (as_zmk_custom_settings_initialized(eh) != NULL) {
+        pmw3610_settings_apply_to_all_devices();
+        return 0;
+    }
+
     const struct zmk_custom_setting_changed *ev = as_zmk_custom_setting_changed(eh);
     if (!ev || !ev->setting) {
         return 0;
@@ -359,5 +383,6 @@ static int pmw3610_settings_changed_listener(const zmk_event_t *eh) {
     return 0;
 }
 
-ZMK_LISTENER(pmw3610_settings, pmw3610_settings_changed_listener);
+ZMK_LISTENER(pmw3610_settings, pmw3610_settings_event_listener);
 ZMK_SUBSCRIPTION(pmw3610_settings, zmk_custom_setting_changed);
+ZMK_SUBSCRIPTION(pmw3610_settings, zmk_custom_settings_initialized);

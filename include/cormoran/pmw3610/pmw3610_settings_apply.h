@@ -20,16 +20,21 @@
  *   - main(): settings_load() loads persisted values from flash, which is
  *     the point at which "effective value" becomes meaningful.
  *
- * Since main() runs after all SYS_INIT levels but the async init work is
- * timer-delayed by ~260ms (well after main() has returned in practice),
- * applying settings once more from a SYS_INIT(APPLICATION) hook would
- * almost always be safe -- but "almost always" is exactly the kind of
- * boot-order assumption this project wants to avoid baking in silently.
- * Instead, the driver calls this function directly from
- * pmw3610_async_init_configure(), i.e. strictly after main()'s
- * settings_load() has already returned (both run on cooperating threads,
- * and the async init work is scheduled well after main() starts), so there
- * is no race: by the time this runs, settings_load() is guaranteed done.
+ * The async init work is timer-delayed by ~260ms, so in the common case it
+ * runs after main()'s settings_load() has returned and this apply sees the
+ * persisted values. That timing is NOT guaranteed, though: settings_load()
+ * runs on the main thread while async init runs on the (higher-priority,
+ * preempting) system workqueue, and a large NVS -- e.g. BLE bonds on a real
+ * keyboard -- can make settings_load() outlast the ~260ms delay. When it
+ * does, this call reads compiled-in defaults, and since the plain
+ * zmk-feature-custom-settings load path raises no change event, nothing would
+ * ever correct it. The deterministic fix lives in
+ * src/settings/pmw3610_settings.c: a zmk_custom_settings_initialized listener
+ * re-applies every device once that event fires (raised once per boot,
+ * strictly after settings_load() has populated every effective value). This
+ * async-init call remains as the fast path for the common
+ * (settings-already-loaded) case; the event listener is the backstop that
+ * closes the race.
  *
  * When CONFIG_ZMK_PMW3610_CUSTOM_SETTINGS is disabled, this call is
  * compiled out entirely (see the IS_ENABLED guard at the call site in
