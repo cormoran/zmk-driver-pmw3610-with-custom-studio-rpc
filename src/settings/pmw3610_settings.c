@@ -132,7 +132,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #define PMW3610_REST2_DOWNSHIFT_MAX (255 * 128 * PMW3610_DEFAULT_REST2_SAMPLE_MS)
 
 /* Thin wrappers over zmk-feature-custom-settings' registration macro, fixing
- * the common fields (subsystem id, RPC-public, unsecure read/write) so each
+ * the common fields (subsystem id, RPC-public, unsecure read, secure write) so each
  * per-instance definition below is a single line. _key is a per-instance
  * mutable buffer whose contents are filled at boot (see below); the macro only
  * stores the pointer. _constraint is one constraint expression, e.g.
@@ -141,14 +141,13 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
     ZMK_CUSTOM_SETTING_DEFINE(                                                                     \
         _name, PMW3610_SETTINGS_SUBSYSTEM_ID, _key, ZMK_CUSTOM_SETTING_VALUE_TYPE_INT32,           \
         ZMK_CUSTOM_SETTING_VALUE_INT32(_default), ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,   \
-        ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE, ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,            \
-        _constraint)
+        ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE, ZMK_CUSTOM_SETTING_PERMISSION_SECURE, _constraint)
 
 #define PMW3610_SETTING_BOOL(_name, _key, _default)                                                \
     ZMK_CUSTOM_SETTING_DEFINE(                                                                     \
         _name, PMW3610_SETTINGS_SUBSYSTEM_ID, _key, ZMK_CUSTOM_SETTING_VALUE_TYPE_BOOL,            \
         ZMK_CUSTOM_SETTING_VALUE_BOOL(_default), ZMK_CUSTOM_SETTING_CONFIDENTIALITY_RPC_PUBLIC,    \
-        ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE, ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE,            \
+        ZMK_CUSTOM_SETTING_PERMISSION_UNSECURE, ZMK_CUSTOM_SETTING_PERMISSION_SECURE,              \
         ZMK_CUSTOM_SETTING_NO_CONSTRAINT)
 
 /* --- Per-instance key storage + settings entries ----------------------- */
