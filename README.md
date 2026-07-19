@@ -550,6 +550,44 @@ west zmk-test tests -m .
 cd web && npm test
 ```
 
+### Hardware-free Renode test (simulated PMW3610)
+
+`tests/renode/` boots the firmware in the [Renode](https://renode.io/)
+emulator against a **simulated PMW3610 sensor** and drives the driver end to
+end — the power-up/self-test handshake and motion reporting — with no J-Link
+and no real trackball. This complements the native_sim unit tests (which
+can't exercise the SPI register protocol or the motion IRQ) and the build
+tests (which only prove the image links).
+
+The sensor model is a small C# SPI peripheral, `tests/renode/platforms/PMW3610.cs`,
+that answers the driver's register protocol (product id `0x3E`, the
+OBSERVATION self-test nibble, `MOTION_BURST` reports) and drives the motion
+IRQ line. `tests/renode/platforms/xiao_pmw3610.repl` wires it onto SPIM0 with
+the same chip-select and IRQ pins the test snippet's devicetree uses.
+(`NRF52840_GPIO_WithLatch.cs` there fills in the GPIO `LATCH` register that
+Renode's stock model omits, which the nRF level-sensitive interrupt path
+needs.)
+
+```bash
+# Build the emulation-only image (see tests/zmk-config/build-renode.yaml)
+west zmk-build tests/zmk-config \
+  --build-yaml tests/zmk-config/build-renode.yaml -af renode
+
+# Boot it against the simulated sensor and run the driver tests. Renode is
+# downloaded automatically on first use (portable tarball, cached under
+# ~/.renode). --skip-smoke: the generic smoke test uses a sensor-less
+# platform, so run only this module's sensor tests.
+west zmk-renode-test tests/renode \
+  --elf build/renode/zephyr/zmk.elf --skip-smoke
+```
+
+> If you build from a west-workspace layout (Option 1 above) where a parent
+> directory carries its own `zephyr/module.yml`, add
+> `--extra-module-auto-discovery zmk-config current` to the `zmk-build`
+> command so it does not pick up that unrelated module.
+
+CI runs this automatically in the `Renode PMW3610 Test` job.
+
 ### Sync changes from template
 
 Run `Actions > Sync Changes in Template > Run workflow` to get the latest template changes as a pull request.

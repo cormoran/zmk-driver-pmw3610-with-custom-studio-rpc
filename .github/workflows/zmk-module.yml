@@ -58,6 +58,40 @@ jobs:
           path: |
             build/*/zephyr/zmk.uf2
 
+  renode-test:
+    runs-on: ubuntu-latest
+    # Building the renode artifact + installing Renode (cached after the
+    # first run) + booting the emulator takes longer than a plain build.
+    timeout-minutes: 20
+    container:
+      image: zmkfirmware/zmk-build-arm:stable
+    name: Renode PMW3610 Test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/west-init
+      - name: Build Renode firmware
+        # Emulation-only image (PMW3610 driver + Studio/console over UART);
+        # see tests/zmk-config/build-renode.yaml. Writes build/renode/.
+        run: >-
+          west zmk-build tests/zmk-config
+          --build-yaml tests/zmk-config/build-renode.yaml -af renode
+      - name: Cache Renode install
+        uses: actions/cache@v4
+        with:
+          path: ~/.renode
+          key: renode-1.16.1-${{ runner.os }}
+      - name: Run Renode PMW3610 test
+        # Boots the ELF against a simulated PMW3610 sensor (tests/renode/) and
+        # drives the driver through init + motion reporting. --skip-smoke: the
+        # generic smoke test boots on a sensor-less platform and expects a
+        # bare GetDeviceInfo round-trip, which a Studio-enabled image answers
+        # with an unsolicited boot notification first; the sensor test below
+        # already asserts boot + init on the correct platform.
+        run: >-
+          west zmk-renode-test tests/renode
+          --elf build/renode/zephyr/zmk.elf --skip-smoke
+
   keepalive:
     if: github.event_name == 'schedule'
     permissions: write-all
