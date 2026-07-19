@@ -609,12 +609,29 @@ encrypted split link and the peripheral driver's init against the sim sensor.
 The DUT halves are the `pmw3610_ble_split_left` (central) / `_right`
 (peripheral) shields, built with `tests/zmk-config/build-ble-split.yaml`.
 
-> **Status: pending a zmk-west-commands fix.** A relayed `DeviceInfo` response
-> is larger than one BLE PDU, and Renode's emulated-BLE radio currently drops
-> the link on multi-fragment responses. A fix (plus a `renode-ble-host` able to
-> issue an arbitrary framed request via `CONFIG_RENODE_BLE_HOST_REQUEST_HEX`) is
-> in a separate zmk-west-commands PR; until it lands and this module re-pins to
-> it, the test **skips**. The build artifacts already compile. Run it with:
+> **Status: blocked by Renode emulator limitations (the test skips).** After a
+> deep investigation, the PMW3610 relay *data* round-trip cannot currently be
+> emulated in Renode, for two independent reasons:
+>
+> 1. **Over BLE** (where ZMK implements the split relay): a relayed `DeviceInfo`
+>    response is larger than one small BLE PDU, and Renode's soft link-layer
+>    desyncs (SN/NESN retransmit stall) once request+response bidirectional data
+>    is in flight, so anything past ~a tiny single-PDU response drops or never
+>    arrives. Only tiny responses (e.g. `get_lock_state`) round-trip.
+> 2. **Over a wired split** (where Renode has no such radio limit): ZMK
+>    implements the split relay-event transport **only over BLE**
+>    (`zmk_split_central_send_relay_event` lives in the BLE split service), so a
+>    wired-split central does not even link.
+>
+> Additionally, the same large-response size stalls the **Studio-UART** TX path
+> under Renode (~30 B ring-buffer stall), so even the single-image
+> `pmw3610_rpc_renode_test.py` (GetInfo over UART, no relay) skips today. The
+> request → driver → sensor path is proven (the sensor's product-id `0x3e`
+> appears in the partial response); only the full response transmission stalls.
+>
+> All build artifacts compile and the topology/sensor pieces work. A future
+> zmk-west-commands fix to Renode's Studio transports (BLE soft-LL + UART TX
+> batching) would let these tests assert the full round-trip. Run them with:
 >
 > ```bash
 > west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-ble-split.yaml -af ble-split-central

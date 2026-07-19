@@ -25,3 +25,18 @@ include:
     snippets:
       - renode-studio-uart
       - pmw3610-trackball
+
+  # Same as `renode` but with the PMW3610 custom Studio RPC enabled, so a test
+  # can drive `cormoran__pmw3610` GetInfo/ReadRegister over the emulated Studio
+  # UART against the simulated sensor. TX_BUF_SIZE=256 (tester_xiao.conf) lets
+  # the ~50-80 B GetInfo response out without the 64 B ring-buffer stall.
+  - artifact: renode_rpc
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    cmake-args: >-
+      -DCONFIG_ZMK_STUDIO=y
+      -DCONFIG_ZMK_PMW3610_STUDIO_RPC=y
+      -DCONFIG_PMW3610_LOG_LEVEL_DBG=y
+    snippets:
+      - renode-studio-uart
+      - pmw3610-trackball
