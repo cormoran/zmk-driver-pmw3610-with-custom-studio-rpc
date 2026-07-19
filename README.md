@@ -588,6 +588,47 @@ west zmk-renode-test tests/renode \
 
 CI runs this automatically in the `Renode PMW3610 Test` job.
 
+### Hardware-free BLE-split relay test (host ↔ peripheral PMW3610)
+
+`tests/renode/pmw3610_ble_split_relay_renode_test.py` boots a **wireless BLE
+split** — three emulated nRF52840s on one Renode BLE medium — and drives the
+PMW3610 **split RPC relay** end to end:
+
+```
+Studio host ──BLE(Studio)──▶ split CENTRAL ──BLE(split relay)──▶ split PERIPHERAL (simulated PMW3610)
+```
+
+The host issues a PMW3610 `GetInfo(source=0xFFFFFFFF)` custom Studio RPC to the
+central; the central broadcasts it over the split event relay; the peripheral's
+PMW3610 (backed by the simulated sensor on its SPIM0) answers, and the central
+forwards a `PeripheralResponse` notification to the host. The test asserts the
+host receives the peripheral's `DeviceInfo` (product id `0x3E`, ready) — i.e.
+the host really talked to the peripheral's PMW3610 through the relay — plus the
+encrypted split link and the peripheral driver's init against the sim sensor.
+
+The DUT halves are the `pmw3610_ble_split_left` (central) / `_right`
+(peripheral) shields, built with `tests/zmk-config/build-ble-split.yaml`.
+
+> **Status: pending a zmk-west-commands fix.** A relayed `DeviceInfo` response
+> is larger than one BLE PDU, and Renode's emulated-BLE radio currently drops
+> the link on multi-fragment responses. A fix (plus a `renode-ble-host` able to
+> issue an arbitrary framed request via `CONFIG_RENODE_BLE_HOST_REQUEST_HEX`) is
+> in a separate zmk-west-commands PR; until it lands and this module re-pins to
+> it, the test **skips**. The build artifacts already compile. Run it with:
+>
+> ```bash
+> west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-ble-split.yaml -af ble-split-central
+> west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-ble-split.yaml -af ble-split-peripheral
+> west build -b nrf52840dk/nrf52840 -s <zmk-west-commands>/renode-ble-host -d build/ble-host -- \
+>     -DCONFIG_RENODE_BLE_HOST_TARGET_NAME='"PMW3610"' \
+>     -DCONFIG_RENODE_BLE_HOST_REQUEST_HEX='"ab0801a2060c120a12080a0608ffffffff0fad"'
+> west zmk-renode-test --mode ble-split \
+>     --elf build/ble-split-central/zephyr/zmk.elf \
+>     --peripheral-elf build/ble-split-peripheral/zephyr/zmk.elf \
+>     --host-elf build/ble-host/zephyr/zephyr.elf \
+>     tests/renode
+> ```
+
 ### Sync changes from template
 
 Run `Actions > Sync Changes in Template > Run workflow` to get the latest template changes as a pull request.
