@@ -1,0 +1,69 @@
+:name: PMW3610 wireless split (peripheral w/ simulated PMW3610 + central + host)
+:description: Three nRF52840s on one BLE medium: split PERIPHERAL (real PMW3610 on
+:description: SPIM0) -> split CENTRAL (Studio + PMW3610 relay bridge) -> renode-ble-host.
+
+# Module-local counterpart of zmk-west-commands' three_machine_ble.resc, adapted
+# so the split PERIPHERAL machine carries a *simulated PMW3610* on SPIM0 (via the
+# compiled-in PMW3610.cs sensor model + the LATCH-aware GPIO), so the peripheral's
+# ZMK PMW3610 driver inits for real and answers relayed GetInfo/ReadRegister
+# requests. The host drives the PMW3610 custom Studio RPC against the CENTRAL,
+# which relays to the peripheral over the split event relay.
+#
+# All path variables are materialized (absolute) by pmw3610_ble_split_lib.py:
+#   $*_platform : per-machine real repls (FICR-injected). $peripheral_platform is
+#     the sensor variant xiao_nrf52840_real_pmw3610.repl. $ccm : fake AES-CCM.
+#   $cs_pmw / $cs_latch : the C# sensor + LATCH-GPIO models (compiled first).
+
+using sysbus
+
+$central_bin?=@central.elf
+$peripheral_bin?=@peripheral.elf
+$host_bin?=@host.elf
+$central_platform?=@platforms/xiao_nrf52840_real.repl
+$peripheral_platform?=@platforms/xiao_nrf52840_real_pmw3610.repl
+$host_platform?=@platforms/xiao_nrf52840_real.repl
+$ccm?=@platforms/ccm.repl
+$c_console?=3471
+$c_rpc?=3472
+$p_console?=3473
+$h_console?=3474
+
+# Compile the C# sensor + LATCH-GPIO models before any platform that instantiates
+# them loads (the peripheral platform references SPI.PMW3610 + NRF52840_GPIO_WithLatch).
+include $cs_pmw
+include $cs_latch
+
+emulation CreateBLEMedium "wireless"
+emulation SetGlobalQuantum "0.00001"
+
+# ---- central (Studio + PMW3610 split-relay bridge, GAP central + peripheral) --
+mach create "central"
+machine LoadPlatformDescription $central_platform
+machine LoadPlatformDescription $ccm
+connector Connect sysbus.radio wireless
+emulation CreateServerSocketTerminal $c_console "central_console" false
+connector Connect sysbus.uart0 central_console
+emulation CreateServerSocketTerminal $c_rpc "central_rpc" false
+connector Connect sysbus.uart1 central_rpc
+sysbus LoadELF $central_bin
+
+# ---- peripheral (real PMW3610 on SPIM0) --------------------------------------
+mach create "peripheral"
+machine LoadPlatformDescription $peripheral_platform
+machine LoadPlatformDescription $ccm
+connector Connect sysbus.radio wireless
+emulation CreateServerSocketTerminal $p_console "peripheral_console" false
+connector Connect sysbus.uart0 peripheral_console
+sysbus LoadELF $peripheral_bin
+
+# ---- host (renode-ble-host) --------------------------------------------------
+mach create "host"
+machine LoadPlatformDescription $host_platform
+machine LoadPlatformDescription $ccm
+connector Connect sysbus.radio wireless
+emulation CreateServerSocketTerminal $h_console "host_console" false
+connector Connect sysbus.uart0 host_console
+sysbus LoadELF $host_bin
+
+# The lib sets up SEGGER RTT capture on the peripheral, preloads both ZMK halves'
+# NVS (erased 0xFF), and issues `start` after connecting sockets.

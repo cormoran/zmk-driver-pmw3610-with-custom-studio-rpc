@@ -1,0 +1,17 @@
+# Real-hardware BLE Studio image for `west zmk-renode-test --mode ble` (and the
+# building block for the ble-split relay test). This is the exact
+# `studio-rpc-usb-uart` image you would flash (USB CDC + QSPI NOR + BLE) with
+# the PMW3610 custom Studio RPC enabled; Renode's real-boot platform stubs make
+# it boot unmodified. `CONFIG_ZMK_BLE` defaults on for xiao_ble, so the DUT
+# advertises and the renode-ble-host can pair. tester_xiao names the DUT
+# "Module Test" (matches the host's default "Module" target-name prefix).
+#
+#   west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-ble.yaml -af ble
+include:
+  - artifact: ble
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_PMW3610_STUDIO_RPC=y
+    snippets:
+      - studio-rpc-usb-uart
+      - pmw3610-trackball

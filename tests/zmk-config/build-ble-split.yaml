@@ -1,0 +1,41 @@
+# Real-hardware DUT images for `west zmk-renode-test --mode ble-split` with the
+# PMW3610 split RPC relay (see the repo README + zmk-west-commands' README
+# "ble-split mode"). Builds BOTH halves of a wireless BLE split keyboard exactly
+# as you would flash them, plus routes the relay so a Studio host talking to the
+# central can reach the PERIPHERAL's PMW3610 over the split event relay:
+#
+#   * ble-split-central  = pmw3610_ble_split_left  = split CENTRAL. Runs ZMK
+#     Studio (studio-rpc-usb-uart) + the PMW3610 custom RPC + the split RPC
+#     relay bridge (central role). Advertises "PMW3610 Central" for the host.
+#   * ble-split-peripheral = pmw3610_ble_split_right = split PERIPHERAL. Carries
+#     a real PMW3610 on SPIM0 (the shield overlay) + the split RPC relay
+#     (peripheral role). Under Renode a simulated PMW3610 answers on that bus.
+#
+# Build both with:
+#   west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-ble-split.yaml -af ble-split-central
+#   west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-ble-split.yaml -af ble-split-peripheral
+#
+# Both halves cap CONFIG_BT_CTLR_DATA_LENGTH_MAX=27 (in the shield .conf files)
+# for Renode's radio packet cap.
+include:
+  - artifact: ble-split-central
+    board: xiao_ble//zmk
+    shield: pmw3610_ble_split_left
+    snippets:
+      - studio-rpc-usb-uart
+      - pmw3610-split-rpc-relay
+      - pmw3610-split-central
+
+  # The peripheral gets the PMW3610 driver (CONFIG_PMW3610 + input/pointing)
+  # via cmake-args rather than the pmw3610-trackball snippet, because that
+  # snippet's overlay would re-define the sensor node + kscan/transform this
+  # shield already provides (the sensor node lives in the right overlay).
+  - artifact: ble-split-peripheral
+    board: xiao_ble//zmk
+    shield: pmw3610_ble_split_right
+    cmake-args: >-
+      -DCONFIG_PMW3610=y
+      -DCONFIG_INPUT=y
+      -DCONFIG_ZMK_POINTING=y
+    snippets:
+      - pmw3610-split-rpc-relay

@@ -1,0 +1,12 @@
+file_format: "1"
+id: pmw3610_ble_split
+name: PMW3610 BLE Split
+type: shield
+requires: [seeed_xiao]
+features:
+  - keys
+  - studio
+  - pointer
+siblings:
+  - pmw3610_ble_split_left
+  - pmw3610_ble_split_right

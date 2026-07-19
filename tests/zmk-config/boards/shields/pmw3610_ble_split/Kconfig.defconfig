@@ -1,0 +1,30 @@
+# Roles + a stable advertised name for the renode-ble-host to scan for.
+# Mirrors zmk-west-commands' renode_split shield, but the central here also
+# fronts the PMW3610 split RPC relay (enabled via the build-ble-split.yaml
+# snippets), and the peripheral carries a real PMW3610 (its overlay).
+
+if SHIELD_PMW3610_BLE_SPLIT_LEFT
+
+# The central is the DUT the renode-ble-host connects to; its advertised name
+# must start with CONFIG_RENODE_BLE_HOST_TARGET_NAME (built as "PMW3610").
+config ZMK_KEYBOARD_NAME
+    default "PMW3610 Central"
+
+config ZMK_SPLIT_ROLE_CENTRAL
+    default y
+
+endif
+
+if SHIELD_PMW3610_BLE_SPLIT_RIGHT
+
+config ZMK_KEYBOARD_NAME
+    default "PMW3610 Periph"
+
+endif
+
+if SHIELD_PMW3610_BLE_SPLIT_LEFT || SHIELD_PMW3610_BLE_SPLIT_RIGHT
+
+config ZMK_SPLIT
+    default y
+
+endif

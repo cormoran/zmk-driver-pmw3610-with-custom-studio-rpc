@@ -1,0 +1,4 @@
+/* pmw3610_ble_split central half (left). See pmw3610_ble_split.dtsi.
+ * No local sensor -- the central only runs Studio + the PMW3610 split RPC
+ * relay bridge (enabled via build-ble-split.yaml's snippets). */
+#include "pmw3610_ble_split.dtsi"
