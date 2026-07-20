@@ -1,0 +1,48 @@
+# Real-hardware DUT images for `west zmk-renode-test --mode wired-split` (= the
+# usb-host-link x wired-split-link combination) with the PMW3610 split RPC relay
+# (see the repo README's "Hardware-free split-relay test"). Builds BOTH halves of
+# a WIRED split keyboard, routing the relay so a Studio host talking to the
+# central OVER USB can reach the PERIPHERAL's PMW3610 across the wired split event
+# relay:
+#
+#   * usb-wired-central  = pmw3610_usb_wired_split_left  = split CENTRAL. Runs ZMK
+#     Studio over USB CDC (studio-rpc-usb-uart) + the PMW3610 custom RPC + the
+#     split RPC relay bridge (central role). Speaks the wired split on uart1.
+#   * usb-wired-peripheral = pmw3610_usb_wired_split_right = split PERIPHERAL.
+#     Carries a real PMW3610 on SPIM0 (the shield overlay) + the split RPC relay
+#     (peripheral role). Under Renode a simulated PMW3610 answers on that bus.
+#
+# Why usb+wired: a WIRED split whose central STILL speaks Studio. USB consumes no
+# UARTE, so the central keeps its console on uart0 AND drives the zmk,wired-split
+# link on uart1 while Studio RPC rides the emulated USB CDC. The relayed PMW3610
+# DeviceInfo response round-trips this way with no radio cap and no Renode
+# Studio-UART TX path in the way.
+#
+# Build both with:
+#   west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-central
+#   west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-peripheral
+#
+# Uses the wired split relay-event transport in the zmk revision pinned by
+# west/west-dependency/west-test-dependency.yml (main+custom-studio-protocol).
+include:
+  - artifact: usb-wired-central
+    board: xiao_ble//zmk
+    shield: pmw3610_usb_wired_split_left
+    snippets:
+      - studio-rpc-usb-uart
+      - pmw3610-split-rpc-relay
+      - pmw3610-split-central
+
+  # The peripheral gets the PMW3610 driver (CONFIG_PMW3610 + input/pointing)
+  # via cmake-args rather than the pmw3610-trackball snippet, because that
+  # snippet's overlay would re-define the sensor node + kscan/transform this
+  # shield already provides (the sensor node lives in the right overlay).
+  - artifact: usb-wired-peripheral
+    board: xiao_ble//zmk
+    shield: pmw3610_usb_wired_split_right
+    cmake-args: >-
+      -DCONFIG_PMW3610=y
+      -DCONFIG_INPUT=y
+      -DCONFIG_ZMK_POINTING=y
+    snippets:
+      - pmw3610-split-rpc-relay

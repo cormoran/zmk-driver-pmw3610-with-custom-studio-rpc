@@ -588,6 +588,48 @@ west zmk-renode-test tests/renode \
 
 CI runs this automatically in the `Renode PMW3610 Test` job.
 
+### Hardware-free split-relay test (host ↔ peripheral PMW3610)
+
+`tests/renode/pmw3610_usb_wired_split_relay_renode_test.py` proves the split
+event relay end to end with **no hardware**: a Studio host reads the split
+**peripheral**'s PMW3610 through the relay. It boots two real nRF52840 images on
+one Renode session:
+
+```
+host ──USB(Studio)──▶ CENTRAL ──wired split (relay)──▶ PERIPHERAL (simulated PMW3610)
+```
+
+The host issues `GetInfo(source = PMW3610_SOURCE_ALL)` over the central's
+emulated USB CDC; the central relays it to the peripheral over the
+[`zmk,wired-split`](https://zmk.dev/docs/development/hardware-integration/wired-split)
+link (using ZMK's relay-event transport), the peripheral's driver answers
+against the simulated sensor, and the central forwards the answer back to the
+host as a `PeripheralResponse` notification. The test asserts the host receives
+the peripheral's real `DeviceInfo` — product id `0x3E`, `ready`.
+
+This is the `usb`×`wired` combination: a wired split whose central still speaks
+Studio, over USB (which consumes no UARTE, leaving `uart1` for the split link).
+The two halves are the `pmw3610_usb_wired_split_{left,right}` shields, built with
+`tests/zmk-config/build-usb-split.yaml`.
+
+```bash
+west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-central
+west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-peripheral
+
+# Boots both halves + drives the relay round-trip (needs a wired-split-capable
+# zmk-west-commands; run only this module's tests with --skip-smoke).
+west zmk-renode-test --mode wired-split \
+  --elf build/usb-wired-central/zephyr/zmk.elf \
+  --peripheral-elf build/usb-wired-peripheral/zephyr/zmk.elf \
+  tests/renode --skip-smoke
+```
+
+> The central shield sets `CONFIG_ZMK_STUDIO_LOCKING=n`: a headless Renode run
+> has no physical unlock key, and Studio otherwise rejects every RPC with
+> `UNLOCK_REQUIRED` before it can dispatch the relay.
+
+CI runs this automatically in the `Renode PMW3610 wired-split relay test` job.
+
 ### Sync changes from template
 
 Run `Actions > Sync Changes in Template > Run workflow` to get the latest template changes as a pull request.

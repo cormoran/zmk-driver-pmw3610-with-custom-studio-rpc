@@ -1,0 +1,5 @@
+/* pmw3610_usb_wired_split CENTRAL half (left). See pmw3610_usb_wired_split.dtsi.
+ * No local sensor -- the central only runs Studio (over USB) + the PMW3610 split
+ * RPC relay bridge (enabled via build-usb-split.yaml's snippets). USB stays on
+ * (the shared dtsi keeps &usbd enabled), so no extra devicetree is needed here. */
+#include "pmw3610_usb_wired_split.dtsi"

@@ -1,0 +1,28 @@
+# Roles + names for the usb+wired PMW3610 split. The central (left) fronts the
+# PMW3610 split RPC relay and answers Studio over USB; the peripheral (right)
+# carries the real PMW3610 and the relay's peripheral role. Split transport is
+# WIRED -- BLE is disabled in the .conf files (unlike pmw3610_ble_split).
+
+if SHIELD_PMW3610_USB_WIRED_SPLIT_LEFT
+
+config ZMK_KEYBOARD_NAME
+    default "PMW3610 UWCentral"
+
+config ZMK_SPLIT_ROLE_CENTRAL
+    default y
+
+endif
+
+if SHIELD_PMW3610_USB_WIRED_SPLIT_RIGHT
+
+config ZMK_KEYBOARD_NAME
+    default "PMW3610 UWPeriph"
+
+endif
+
+if SHIELD_PMW3610_USB_WIRED_SPLIT_LEFT || SHIELD_PMW3610_USB_WIRED_SPLIT_RIGHT
+
+config ZMK_SPLIT
+    default y
+
+endif
