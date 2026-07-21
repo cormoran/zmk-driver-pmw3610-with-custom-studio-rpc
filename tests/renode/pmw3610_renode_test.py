@@ -87,6 +87,17 @@ class PMW3610RenodeTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # This is the single-board sensor test. `west zmk-renode-test` globs every
+        # *_test.py in tests/renode/, so a split run (e.g. --mode wired-split for
+        # the relay test) would otherwise try to boot this against the split
+        # central ELF. Skip when a split link is active; the split relay test owns
+        # that case.
+        if os.environ.get("ZMK_RENODE_SPLIT_LINK", "none") != "none":
+            raise unittest.SkipTest(
+                "single-board sensor test; skipped for split runs "
+                f"(ZMK_RENODE_SPLIT_LINK={os.environ.get('ZMK_RENODE_SPLIT_LINK')})"
+            )
+
         cls.elf = _resolve_elf()
         if not cls.elf.is_file():
             raise unittest.SkipTest(
