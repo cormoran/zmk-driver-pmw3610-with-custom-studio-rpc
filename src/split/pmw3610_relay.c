@@ -132,34 +132,41 @@ struct zmk_pmw3610_relay_notification {
     uint8_t payload[PMW3610_RELAY_NOTIFICATION_PAYLOAD_MAX_SIZE];
 };
 
-BUILD_ASSERT(sizeof(struct zmk_pmw3610_relay_request) <= CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN,
+/* The *_SERIALIZE relay variants below put only each event's actually-encoded
+ * `size` bytes on the wire, not the whole fixed-size struct -- so a 3-byte
+ * GetInfo request no longer costs a full CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN
+ * transfer, and frame streaming's many small FrameStreamChunk notifications each
+ * cost only their real size (the BLE relay transport chunks by event_data_size).
+ * The framework still serializes into a CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN
+ * buffer, so the largest encoded payload must still fit it -- the serialize fn
+ * bounds-checks at runtime and these assert it at build time (on the encoded
+ * payload max, not sizeof(struct), since the struct itself is never relayed). */
+BUILD_ASSERT(PMW3610_RELAY_REQUEST_PAYLOAD_MAX_SIZE <= CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN,
              "CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN is too small for the pmw3610 relay request "
              "payload -- raise it (see DESIGN.md Phase F / Kconfig help for "
              "ZMK_PMW3610_SPLIT_RPC_RELAY)");
-BUILD_ASSERT(sizeof(struct zmk_pmw3610_relay_response) <= CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN,
+BUILD_ASSERT(PMW3610_RELAY_RESPONSE_PAYLOAD_MAX_SIZE <= CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN,
              "CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN is too small for the pmw3610 relay response "
              "payload -- raise it (see DESIGN.md Phase F / Kconfig help for "
              "ZMK_PMW3610_SPLIT_RPC_RELAY)");
-BUILD_ASSERT(sizeof(struct zmk_pmw3610_relay_notification) <= CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN,
+BUILD_ASSERT(PMW3610_RELAY_NOTIFICATION_PAYLOAD_MAX_SIZE <= CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN,
              "CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN is too small for the pmw3610 relay "
              "notification payload -- raise it (see DESIGN.md Phase F / Kconfig help for "
              "ZMK_PMW3610_SPLIT_RPC_RELAY)");
 /* Hard transport ceiling, independent of CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN:
  * struct relay_event_header (zmk/split/transport/types.h) encodes a relayed
  * event's data size in a single `uint8_t event_data_size` wire field, so no
- * relayed event can ever exceed 255 bytes regardless of how high
- * CONFIG_ZMK_SPLIT_RELAY_EVENT_DATA_LEN is set. If either of pmw3610's own
- * relay structs exceeds that, raising the Kconfig value would not help --
+ * relayed event can ever exceed 255 bytes. If a pmw3610 encoded payload could,
  * pmw3610.options' GetInfoResponse.devices max_count must come down instead. */
-BUILD_ASSERT(sizeof(struct zmk_pmw3610_relay_request) <= 255,
+BUILD_ASSERT(PMW3610_RELAY_REQUEST_PAYLOAD_MAX_SIZE <= 255,
              "the pmw3610 relay request payload exceeds the split relay transport's 255-byte "
              "hard ceiling (relay_event_header.event_data_size is a uint8_t) -- reduce "
              "pmw3610.options' GetInfoResponse.devices max_count");
-BUILD_ASSERT(sizeof(struct zmk_pmw3610_relay_response) <= 255,
+BUILD_ASSERT(PMW3610_RELAY_RESPONSE_PAYLOAD_MAX_SIZE <= 255,
              "the pmw3610 relay response payload exceeds the split relay transport's 255-byte "
              "hard ceiling (relay_event_header.event_data_size is a uint8_t) -- reduce "
              "pmw3610.options' GetInfoResponse.devices max_count");
-BUILD_ASSERT(sizeof(struct zmk_pmw3610_relay_notification) <= 255,
+BUILD_ASSERT(PMW3610_RELAY_NOTIFICATION_PAYLOAD_MAX_SIZE <= 255,
              "the pmw3610 relay notification payload exceeds the split relay transport's "
              "255-byte hard ceiling (relay_event_header.event_data_size is a uint8_t)");
 
@@ -170,12 +177,49 @@ ZMK_EVENT_IMPL(zmk_pmw3610_relay_request);
 ZMK_EVENT_IMPL(zmk_pmw3610_relay_response);
 ZMK_EVENT_IMPL(zmk_pmw3610_relay_notification);
 
-ZMK_RELAY_EVENT_HANDLE(zmk_pmw3610_relay_request, pmq, source);
-ZMK_RELAY_EVENT_HANDLE(zmk_pmw3610_relay_response, pmp, source);
-ZMK_RELAY_EVENT_HANDLE(zmk_pmw3610_relay_notification, pmn, source);
-ZMK_RELAY_EVENT_CENTRAL_TO_PERIPHERAL(zmk_pmw3610_relay_request, pmq, source);
-ZMK_RELAY_EVENT_PERIPHERAL_TO_CENTRAL(zmk_pmw3610_relay_response, pmp, source);
-ZMK_RELAY_EVENT_PERIPHERAL_TO_CENTRAL(zmk_pmw3610_relay_notification, pmn, source);
+/* Serialize/deserialize the pre-encoded protobuf in `payload` (its actual
+ * `size` bytes), used by the *_SERIALIZE relay macros below. All three structs
+ * share {source, size, payload[]}, so one macro defines both halves. Each
+ * serialize fn is referenced only by the sending side for its direction (the
+ * central sends requests, the peripheral sends responses/notifications), so
+ * __maybe_unused keeps the unused half quiet on the opposite role. `source` is
+ * NOT serialized -- the relay framework carries it and rewrites it on receive
+ * (ev->source + 1) per ZMK_RELAY_EVENT_HANDLE_DESERIALIZE's source_field_name. */
+#define PMW3610_RELAY_DEFINE_SERDES(type)                                                          \
+    static int __maybe_unused type##_serialize(const struct type *ev, uint8_t *event_data,         \
+                                               size_t max_size) {                                  \
+        if (ev->size > max_size) {                                                                 \
+            return -EMSGSIZE;                                                                      \
+        }                                                                                          \
+        memcpy(event_data, ev->payload, ev->size);                                                 \
+        return (int)ev->size;                                                                      \
+    }                                                                                              \
+    static int __maybe_unused type##_deserialize(struct type *ev, const uint8_t *event_data,       \
+                                                 size_t size) {                                    \
+        if (size > sizeof(ev->payload)) {                                                          \
+            return -EMSGSIZE;                                                                      \
+        }                                                                                          \
+        memcpy(ev->payload, event_data, size);                                                     \
+        ev->size = (uint16_t)size;                                                                 \
+        return 0;                                                                                  \
+    }
+
+PMW3610_RELAY_DEFINE_SERDES(zmk_pmw3610_relay_request)
+PMW3610_RELAY_DEFINE_SERDES(zmk_pmw3610_relay_response)
+PMW3610_RELAY_DEFINE_SERDES(zmk_pmw3610_relay_notification)
+
+ZMK_RELAY_EVENT_HANDLE_DESERIALIZE(zmk_pmw3610_relay_request, pmq, source,
+                                   zmk_pmw3610_relay_request_deserialize);
+ZMK_RELAY_EVENT_HANDLE_DESERIALIZE(zmk_pmw3610_relay_response, pmp, source,
+                                   zmk_pmw3610_relay_response_deserialize);
+ZMK_RELAY_EVENT_HANDLE_DESERIALIZE(zmk_pmw3610_relay_notification, pmn, source,
+                                   zmk_pmw3610_relay_notification_deserialize);
+ZMK_RELAY_EVENT_CENTRAL_TO_PERIPHERAL_SERIALIZE(zmk_pmw3610_relay_request, pmq, source,
+                                                zmk_pmw3610_relay_request_serialize);
+ZMK_RELAY_EVENT_PERIPHERAL_TO_CENTRAL_SERIALIZE(zmk_pmw3610_relay_response, pmp, source,
+                                                zmk_pmw3610_relay_response_serialize);
+ZMK_RELAY_EVENT_PERIPHERAL_TO_CENTRAL_SERIALIZE(zmk_pmw3610_relay_notification, pmn, source,
+                                                zmk_pmw3610_relay_notification_serialize);
 
 /* --- Peripheral role: execute a relayed request, relay the response back --- */
 

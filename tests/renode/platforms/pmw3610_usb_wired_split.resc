@@ -1,0 +1,65 @@
+:name: XIAO nRF52840 usb+wired PMW3610 split -- central Studio over USB + wired split relay
+:description: Two machines. central = real studio-rpc-usb-uart image with a WIRED
+:description: split link (Studio rides emulated USB CDC, console on uart0, split on
+:description: uart1); peripheral = wired-split half carrying a simulated PMW3610 on
+:description: SPIM0. The harness preloads the central NVS, calls `start`, then
+:description: attaches the USB CDC bridge.
+
+# Module-local variant of zmk-west-commands' platforms/usb_wired_split.resc: the
+# PERIPHERAL machine here loads xiao_pmw3610.repl (SPIM0 + simulated PMW3610 +
+# the LATCH-aware GPIO for the level-triggered motion IRQ) instead of the plain
+# wired-split repl, so the peripheral's ZMK driver inits for real and answers
+# relayed GetInfo/ReadRegister requests over the wired split event relay. The
+# central is the unchanged real studio-rpc-usb-uart image on the NRF_USBD_Full
+# USB platform, so it answers Studio RPC over the emulated USB CDC (attached by
+# the harness after boot) -- the transport that round-trips the large relayed
+# PMW3610 response, unlike the Renode Studio-UART TX path or the emulated BLE link.
+#
+# This script only wires everything up; the harness (pmw3610_usb_wired_split_lib.boot)
+# preloads the central's NVS storage partition (erased 0xFF), issues `start` after
+# connecting the console sockets, then attaches the USB CDC bridge -- so no early
+# boot-banner bytes are lost.
+
+using sysbus
+
+# $central_platform is the real USB repl with absolute model-.py paths,
+# materialized by the boot helper. PMW3610.cs / the LATCH GPIO are compiled here
+# before the peripheral platform (which instantiates SPI.PMW3610) loads.
+$central_bin?=@central.elf
+$peripheral_bin?=@peripheral.elf
+$central_platform?=@platforms/xiao_nrf52840_usb.repl
+$central_console_port?=3477
+$peripheral_console_port?=3478
+
+# Both halves are xiao_ble//zmk images linked at the Adafruit-UF2 bootloader
+# partition (CONFIG_FLASH_LOAD_OFFSET). LoadELF sets the entry PC, but `start`
+# resets the core via VTOR, and the vector table (including every UART/GPIO IRQ
+# vector) lives at the load offset, not 0. Without pointing VectorTableOffset
+# there after each LoadELF, interrupts vector into empty flash -- the CPUs still
+# reach main() but the split UARTE RX ISR never fires, so the peripheral
+# receives no relayed command (see zmk-west-commands' usb_wired_split.resc, which
+# does the same).
+$vtor?=0x27000
+
+include @platforms/PMW3610.cs
+include @platforms/NRF52840_GPIO_WithLatch.cs
+
+emulation CreateUARTHub "split_link"
+
+# ---- central (real studio-rpc-usb-uart image + wired split on uart1) ---------
+mach create "central"
+machine LoadPlatformDescription $central_platform
+emulation CreateServerSocketTerminal $central_console_port "central_console_term" false
+connector Connect sysbus.uart0 central_console_term
+connector Connect sysbus.uart1 split_link
+sysbus LoadELF $central_bin
+sysbus.cpu VectorTableOffset $vtor
+
+# ---- peripheral (simulated PMW3610 on SPIM0 + wired split on uart1) ----------
+mach create "peripheral"
+machine LoadPlatformDescription @platforms/xiao_pmw3610.repl
+emulation CreateServerSocketTerminal $peripheral_console_port "peripheral_console_term" false
+connector Connect sysbus.uart0 peripheral_console_term
+connector Connect sysbus.uart1 split_link
+sysbus LoadELF $peripheral_bin
+sysbus.cpu VectorTableOffset $vtor

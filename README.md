@@ -550,6 +550,86 @@ west zmk-test tests -m .
 cd web && npm test
 ```
 
+### Hardware-free Renode test (simulated PMW3610)
+
+`tests/renode/` boots the firmware in the [Renode](https://renode.io/)
+emulator against a **simulated PMW3610 sensor** and drives the driver end to
+end — the power-up/self-test handshake and motion reporting — with no J-Link
+and no real trackball. This complements the native_sim unit tests (which
+can't exercise the SPI register protocol or the motion IRQ) and the build
+tests (which only prove the image links).
+
+The sensor model is a small C# SPI peripheral, `tests/renode/platforms/PMW3610.cs`,
+that answers the driver's register protocol (product id `0x3E`, the
+OBSERVATION self-test nibble, `MOTION_BURST` reports) and drives the motion
+IRQ line. `tests/renode/platforms/xiao_pmw3610.repl` wires it onto SPIM0 with
+the same chip-select and IRQ pins the test snippet's devicetree uses.
+(`NRF52840_GPIO_WithLatch.cs` there fills in the GPIO `LATCH` register that
+Renode's stock model omits, which the nRF level-sensitive interrupt path
+needs.)
+
+```bash
+# Build the emulation-only image (see tests/zmk-config/build-renode.yaml)
+west zmk-build tests/zmk-config \
+  --build-yaml tests/zmk-config/build-renode.yaml -af renode
+
+# Boot it against the simulated sensor and run the driver tests. Renode is
+# downloaded automatically on first use (portable tarball, cached under
+# ~/.renode). --skip-smoke: the generic smoke test uses a sensor-less
+# platform, so run only this module's sensor tests.
+west zmk-renode-test tests/renode \
+  --elf build/renode/zephyr/zmk.elf --skip-smoke
+```
+
+> If you build from a west-workspace layout (Option 1 above) where a parent
+> directory carries its own `zephyr/module.yml`, add
+> `--extra-module-auto-discovery zmk-config current` to the `zmk-build`
+> command so it does not pick up that unrelated module.
+
+CI runs this automatically in the `Renode PMW3610 Test` job.
+
+### Hardware-free split-relay test (host ↔ peripheral PMW3610)
+
+`tests/renode/pmw3610_usb_wired_split_relay_renode_test.py` proves the split
+event relay end to end with **no hardware**: a Studio host reads the split
+**peripheral**'s PMW3610 through the relay. It boots two real nRF52840 images on
+one Renode session:
+
+```
+host ──USB(Studio)──▶ CENTRAL ──wired split (relay)──▶ PERIPHERAL (simulated PMW3610)
+```
+
+The host issues `GetInfo(source = PMW3610_SOURCE_ALL)` over the central's
+emulated USB CDC; the central relays it to the peripheral over the
+[`zmk,wired-split`](https://zmk.dev/docs/development/hardware-integration/wired-split)
+link (using ZMK's relay-event transport), the peripheral's driver answers
+against the simulated sensor, and the central forwards the answer back to the
+host as a `PeripheralResponse` notification. The test asserts the host receives
+the peripheral's real `DeviceInfo` — product id `0x3E`, `ready`.
+
+This is the `usb`×`wired` combination: a wired split whose central still speaks
+Studio, over USB (which consumes no UARTE, leaving `uart1` for the split link).
+The two halves are the `pmw3610_usb_wired_split_{left,right}` shields, built with
+`tests/zmk-config/build-usb-split.yaml`.
+
+```bash
+west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-central
+west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-peripheral
+
+# Boots both halves + drives the relay round-trip (needs a wired-split-capable
+# zmk-west-commands; run only this module's tests with --skip-smoke).
+west zmk-renode-test --mode wired-split \
+  --elf build/usb-wired-central/zephyr/zmk.elf \
+  --peripheral-elf build/usb-wired-peripheral/zephyr/zmk.elf \
+  tests/renode --skip-smoke
+```
+
+> The central shield sets `CONFIG_ZMK_STUDIO_LOCKING=n`: a headless Renode run
+> has no physical unlock key, and Studio otherwise rejects every RPC with
+> `UNLOCK_REQUIRED` before it can dispatch the relay.
+
+CI runs this automatically in the `Renode PMW3610 wired-split relay test` job.
+
 ### Sync changes from template
 
 Run `Actions > Sync Changes in Template > Run workflow` to get the latest template changes as a pull request.

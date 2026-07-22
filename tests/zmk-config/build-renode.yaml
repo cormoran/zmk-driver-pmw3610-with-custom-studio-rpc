@@ -1,0 +1,30 @@
+# Renode-testable firmware for the hardware-free PMW3610 emulation test
+# (tests/renode/pmw3610_renode_test.py). Built separately from build.yaml on
+# purpose: it swaps the real USB-CDC console carrier for a real UART via the
+# `renode-console-uart` snippet (vendored under tests/zmk-config/snippets/;
+# Renode's nRF52840 USBD/QSPI models hang a normal build), which must never
+# reach hardware.
+#
+# The test drives the driver purely by reading its LOG lines off the console
+# UART, so this image does not enable ZMK Studio at all -- the wired-split
+# relay test owns the Studio-over-USB path (build-usb-split.yaml).
+#
+# Build it explicitly with:
+#   west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-renode.yaml -af renode
+# then run the emulation test against the ELF (`west zmk-build` writes to
+# <west topdir>/build/<artifact>/, and this repo is its own west workspace):
+#   west zmk-renode-test tests/renode \
+#       --elf build/renode/zephyr/zmk.elf --skip-smoke
+#
+# CONFIG_PMW3610_LOG_LEVEL_DBG surfaces the driver's per-report "x/y: N/N"
+# line on the console UART, which the test asserts against motion injected
+# through the simulated sensor's Renode monitor hooks.
+include:
+  - artifact: renode
+    board: xiao_ble//zmk
+    shield: tester_xiao
+    cmake-args: >-
+      -DCONFIG_PMW3610_LOG_LEVEL_DBG=y
+    snippets:
+      - renode-console-uart
+      - pmw3610-trackball

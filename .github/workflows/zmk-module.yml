@@ -58,6 +58,68 @@ jobs:
           path: |
             build/*/zephyr/zmk.uf2
 
+  renode-test:
+    runs-on: ubuntu-latest
+    # Building the renode artifact + installing Renode (cached after the
+    # first run) + booting the emulator takes longer than a plain build.
+    timeout-minutes: 20
+    container:
+      image: zmkfirmware/zmk-build-arm:stable
+    name: Renode PMW3610 Test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/west-init
+      - name: Build Renode firmware
+        # Emulation-only image (PMW3610 driver + console over a real UART, no
+        # Studio); see tests/zmk-config/build-renode.yaml. Writes build/renode/.
+        run: >-
+          west zmk-build tests/zmk-config
+          --build-yaml tests/zmk-config/build-renode.yaml -af renode
+      # zmk-west-commands' composite action wraps the Renode cache + install
+      # and the `west zmk-renode-test` run (it does not build -- that's the
+      # step above). Default `ble` host-link with no host-elf degrades to a
+      # boot-liveness smoke, which this console-only image passes; then it runs
+      # the module's tests/renode/*_test.py: the sensor test boots its own resc
+      # with the simulated PMW3610 (the relay test self-skips, no peripheral ELF).
+      - name: Run Renode PMW3610 test
+        uses: cormoran/zmk-west-commands/.github/actions/zmk-renode-test@main
+        with:
+          elf-path: build/renode/zephyr/zmk.elf
+          tests: tests/renode
+
+  renode-relay-test:
+    runs-on: ubuntu-latest
+    # Two real images booted on one Renode session + the Renode install.
+    timeout-minutes: 20
+    container:
+      image: zmkfirmware/zmk-build-arm:stable
+    name: Renode PMW3610 wired-split relay test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/west-init
+      - name: Build usb+wired split halves
+        # The Studio central + the split peripheral carrying the simulated
+        # PMW3610; see tests/zmk-config/build-usb-split.yaml.
+        run: >-
+          west zmk-build tests/zmk-config
+          --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-central &&
+          west zmk-build tests/zmk-config
+          --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-peripheral
+      # Same composite action in wired-split mode: its smoke round-trips a core
+      # Studio GetDeviceInfo over the central's USB CDC + a peripheral keypress
+      # over the wired link, then tests/renode runs the split-relay round-trip
+      # (tests/renode/pmw3610_usb_wired_split_relay_renode_test.py; the
+      # single-board sensor test self-skips on a split run).
+      - name: Run split-relay round-trip test
+        uses: cormoran/zmk-west-commands/.github/actions/zmk-renode-test@main
+        with:
+          mode: wired-split
+          elf-path: build/usb-wired-central/zephyr/zmk.elf
+          peripheral-elf: build/usb-wired-peripheral/zephyr/zmk.elf
+          tests: tests/renode
+
   keepalive:
     if: github.event_name == 'schedule'
     permissions: write-all
