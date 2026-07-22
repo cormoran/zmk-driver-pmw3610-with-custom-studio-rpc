@@ -76,20 +76,17 @@ jobs:
         run: >-
           west zmk-build tests/zmk-config
           --build-yaml tests/zmk-config/build-renode.yaml -af renode
-      - name: Cache Renode install
-        uses: actions/cache@v4
-        with:
-          path: ~/.renode
-          key: renode-1.16.1-${{ runner.os }}
+      # zmk-west-commands' composite action wraps the Renode cache + install
+      # and the `west zmk-renode-test` run (it does not build -- that's the
+      # step above). Default `ble` host-link with no host-elf degrades to a
+      # boot-liveness smoke, which this console-only image passes; then it runs
+      # the module's tests/renode/*_test.py: the sensor test boots its own resc
+      # with the simulated PMW3610 (the relay test self-skips, no peripheral ELF).
       - name: Run Renode PMW3610 test
-        # Boots the ELF against a simulated PMW3610 sensor (tests/renode/) and
-        # drives the driver through init + motion reporting. --skip-smoke: the
-        # generic smoke test boots on a sensor-less platform and speaks Studio
-        # RPC over UART, which this console-only image does not carry; the
-        # sensor test below asserts boot + init on the correct platform.
-        run: >-
-          west zmk-renode-test tests/renode
-          --elf build/renode/zephyr/zmk.elf --skip-smoke
+        uses: cormoran/zmk-west-commands/.github/actions/zmk-renode-test@main
+        with:
+          elf-path: build/renode/zephyr/zmk.elf
+          tests: tests/renode
 
   renode-relay-test:
     runs-on: ubuntu-latest
@@ -110,20 +107,18 @@ jobs:
           --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-central &&
           west zmk-build tests/zmk-config
           --build-yaml tests/zmk-config/build-usb-split.yaml -af usb-wired-peripheral
-      - name: Cache Renode install
-        uses: actions/cache@v4
-        with:
-          path: ~/.renode
-          key: renode-1.16.1-${{ runner.os }}
+      # Same composite action in wired-split mode: its smoke round-trips a core
+      # Studio GetDeviceInfo over the central's USB CDC + a peripheral keypress
+      # over the wired link, then tests/renode runs the split-relay round-trip
+      # (tests/renode/pmw3610_usb_wired_split_relay_renode_test.py; the
+      # single-board sensor test self-skips on a split run).
       - name: Run split-relay round-trip test
-        # Host reads the split PERIPHERAL's PMW3610 over the wired split event
-        # relay (tests/renode/pmw3610_usb_wired_split_relay_renode_test.py).
-        # --skip-smoke: only this module's relay test, not the generic smoke.
-        run: >-
-          west zmk-renode-test --mode wired-split
-          --elf build/usb-wired-central/zephyr/zmk.elf
-          --peripheral-elf build/usb-wired-peripheral/zephyr/zmk.elf
-          tests/renode --skip-smoke
+        uses: cormoran/zmk-west-commands/.github/actions/zmk-renode-test@main
+        with:
+          mode: wired-split
+          elf-path: build/usb-wired-central/zephyr/zmk.elf
+          peripheral-elf: build/usb-wired-peripheral/zephyr/zmk.elf
+          tests: tests/renode
 
   keepalive:
     if: github.event_name == 'schedule'
