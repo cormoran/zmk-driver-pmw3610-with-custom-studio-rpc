@@ -1,9 +1,11 @@
 :name: XIAO nRF52840 + simulated PMW3610 trackball
-:description: Boot this module's ZMK image with a PMW3610 simulation on SPIM0; console on uart0, Studio RPC on uart1.
+:description: Boot this module's ZMK image with a PMW3610 simulation on SPIM0; console on uart0.
 
-# Same layout as zmk-west-commands' scripts/lib/renode/platforms/single.resc
-# (console on uart0, Studio RPC on uart1, no `start` -- the harness starts
-# the emulation after it has connected to both UART sockets), plus:
+# Console on uart0, no `start` -- the harness starts the emulation after it has
+# connected to the console UART socket. This build (build-renode.yaml, the
+# renode-console-uart snippet) carries only the driver's LOG output on uart0
+# and does not enable Studio; uart1's rpc_term socket below is created for
+# layout parity with the split resc but stays idle. Plus:
 #   - compiles the PMW3610 sensor simulation (PMW3610.cs) before loading
 #     the platform description that instantiates it
 #   - loads the local xiao_pmw3610.repl (SPIM0 + trackball + CS/IRQ wiring)

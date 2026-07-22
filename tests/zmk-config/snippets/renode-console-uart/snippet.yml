@@ -1,0 +1,4 @@
+name: renode-console-uart
+append:
+  EXTRA_DTC_OVERLAY_FILE: renode-console-uart.overlay
+  EXTRA_CONF_FILE: renode-console-uart.conf

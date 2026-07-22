@@ -1,0 +1,61 @@
+/*
+ * Renode-friendly console-over-UART overlay for the XIAO nRF52840.
+ *
+ * NB: nRF52840/XIAO-specific. This overlay disables `&usbd`/`&qspi`/
+ * `&p25q16h` (nodes that only exist on this SoC/board family) and re-enables
+ * uart0 (the board file disables it because real XIAO boards use USB for the
+ * console). A board/SoC outside that family needs its own overlay.
+ *
+ * Real hardware carries the console over USB-CDC-ACM, but Renode's nRF52840
+ * USBD model does not present a host-openable CDC port, so for emulation we
+ * bind the console + shell to the hardware uart0 peripheral instead. The
+ * pmw3610_renode_test reads the driver's LOG lines off that UART.
+ *
+ * Renode gotcha: the XIAO board dts enables &qspi (the external p25q16h NOR
+ * flash chip) by default. Renode does not model the QSPI peripheral's
+ * EVENTS_READY, so the nrfx QSPI driver's init busy-waits on it forever and
+ * the firmware hangs before it ever reaches main() -- no crash, just infinite
+ * silence. That chip is not ZMK's settings/keymap backend (that's the internal
+ * flash_controller via zephyr,flash = &flash0), so it is safe to disable.
+ */
+
+&qspi {
+    status = "disabled";
+};
+
+/* Disabling the qspi bus node above does NOT auto-disable this child flash
+ * device node (devicetree status does not cascade to children) -- Zephyr
+ * still sees DT_HAS_NORDIC_QSPI_NOR_ENABLED=y from p25q16h alone and builds
+ * the nordic_qspi_nor driver, whose init still pokes the (disabled) QSPI
+ * peripheral's real register addresses directly and hangs the same way.
+ * Must disable both nodes. */
+&p25q16h {
+    status = "disabled";
+};
+
+/* Same class of bug again: xiao_ble_common.dtsi unconditionally includes
+ * <boards/common/usb/cdc_acm_serial.dtsi>, which enables a USB-CDC-ACM UART
+ * node (`board_cdc_acm_uart`, child of &usbd) regardless of snippet. We don't
+ * reference it (console is on uart0 below), but merely being "okay" is enough
+ * for Zephyr to build+init its driver, which busy-waits on USBD:EVENTCAUSE --
+ * a real USB host attach event Renode's USBD model never generates -- hanging
+ * boot the same way QSPI did. Disable both the CDC ACM child node and usbd.
+ */
+&board_cdc_acm_uart {
+    status = "disabled";
+};
+
+&usbd {
+    status = "disabled";
+};
+
+&uart0 {
+    status = "okay";
+};
+
+/ {
+    chosen {
+        zephyr,console = &uart0;
+        zephyr,shell-uart = &uart0;
+    };
+};

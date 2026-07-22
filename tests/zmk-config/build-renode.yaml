@@ -1,9 +1,13 @@
 # Renode-testable firmware for the hardware-free PMW3610 emulation test
 # (tests/renode/pmw3610_renode_test.py). Built separately from build.yaml on
-# purpose: it swaps the real USB-CDC Studio/console carrier for real UARTs
-# via the `renode-studio-uart` snippet (Renode's nRF52840 USBD/QSPI models
-# hang a normal build -- see that snippet in zmk-west-commands), which must
-# never reach hardware.
+# purpose: it swaps the real USB-CDC console carrier for a real UART via the
+# `renode-console-uart` snippet (vendored under tests/zmk-config/snippets/;
+# Renode's nRF52840 USBD/QSPI models hang a normal build), which must never
+# reach hardware.
+#
+# The test drives the driver purely by reading its LOG lines off the console
+# UART, so this image does not enable ZMK Studio at all -- the wired-split
+# relay test owns the Studio-over-USB path (build-usb-split.yaml).
 #
 # Build it explicitly with:
 #   west zmk-build tests/zmk-config --build-yaml tests/zmk-config/build-renode.yaml -af renode
@@ -20,8 +24,7 @@ include:
     board: xiao_ble//zmk
     shield: tester_xiao
     cmake-args: >-
-      -DCONFIG_ZMK_STUDIO=y
       -DCONFIG_PMW3610_LOG_LEVEL_DBG=y
     snippets:
-      - renode-studio-uart
+      - renode-console-uart
       - pmw3610-trackball

@@ -71,8 +71,8 @@ jobs:
         uses: actions/checkout@v4
       - uses: ./.github/actions/west-init
       - name: Build Renode firmware
-        # Emulation-only image (PMW3610 driver + Studio/console over UART);
-        # see tests/zmk-config/build-renode.yaml. Writes build/renode/.
+        # Emulation-only image (PMW3610 driver + console over a real UART, no
+        # Studio); see tests/zmk-config/build-renode.yaml. Writes build/renode/.
         run: >-
           west zmk-build tests/zmk-config
           --build-yaml tests/zmk-config/build-renode.yaml -af renode
@@ -84,10 +84,9 @@ jobs:
       - name: Run Renode PMW3610 test
         # Boots the ELF against a simulated PMW3610 sensor (tests/renode/) and
         # drives the driver through init + motion reporting. --skip-smoke: the
-        # generic smoke test boots on a sensor-less platform and expects a
-        # bare GetDeviceInfo round-trip, which a Studio-enabled image answers
-        # with an unsolicited boot notification first; the sensor test below
-        # already asserts boot + init on the correct platform.
+        # generic smoke test boots on a sensor-less platform and speaks Studio
+        # RPC over UART, which this console-only image does not carry; the
+        # sensor test below asserts boot + init on the correct platform.
         run: >-
           west zmk-renode-test tests/renode
           --elf build/renode/zephyr/zmk.elf --skip-smoke
